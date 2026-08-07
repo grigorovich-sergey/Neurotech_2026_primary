@@ -1,0 +1,49 @@
+output_root: runs
+
+source:
+  mode: virtual
+  recording_path: null
+  replay_paced: false
+  virtual:
+    seed: 42
+    duration_seconds: 2.0
+    scene_width: 640
+    scene_height: 480
+    scene_rate_hz: 10.0
+    gaze_rate_hz: 30.0
+    scene_dropout_probability: 0.0
+    gaze_dropout_probability: 0.0
+    gaze_invalid_probability: 0.0
+
+detector:
+  model: yoloe-26n-seg-pf.pt
+  confidence_threshold: 0.25
+  image_size: 640
+  device: cpu
+
+tracker:
+  activation_threshold: 0.25
+  lost_track_buffer: 30
+  matching_threshold: 0.8
+  frame_rate: 10
+
+association:
+  box_margin_normalized: 0.0
+  max_scene_age_seconds: 0.25
+
+episode:
+  gap_grace_seconds: 0.15
+
+dwell:
+  baseline_seconds: 1.0
+  minimum_seconds: 0.35
+  maximum_seconds: 1.0
+  maximum_reduction_fraction: 0.5
+  max_sample_gap_seconds: 0.10
+
+demo:
+  intent_score: 0.75
+
+visualization:
+  save_frames: true
+  show_window: false
