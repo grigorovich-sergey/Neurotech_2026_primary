@@ -1,0 +1,55 @@
+output_root: runs
+
+source:
+  mode: synthetic
+  replay_path: null
+  replay_paced: false
+  synthetic:
+    seed: 42
+    duration_seconds: 2.0
+    noise_std_uv: 0.0
+    tones:
+      - frequency_hz: 10.0
+        amplitude_uv: 20.0
+    gaps: []
+    invalid_intervals: []
+  guardian:
+    address: null
+    api_token_env: IDUN_API_TOKEN
+    debug: false
+    experiment_start_unix: null
+    recording_seconds: 2
+    impedance:
+      enabled: true
+      duration_seconds: 2.0
+      max_ohms: 300000.0
+      mains_frequency_hz: 60
+
+signal:
+  sample_rate_hz: 250.0
+
+recording:
+  enabled: true
+
+buffer:
+  history_seconds: 30.0
+
+window:
+  start_seconds: 0.0
+  end_seconds: 2.0
+
+preprocessing:
+  low_hz: 1.0
+  high_hz: 40.0
+  order: 4
+
+quality:
+  min_duration_seconds: 1.0
+  min_coverage: 0.95
+  max_gap_seconds: 0.006
+  min_std_uv: 0.05
+  max_peak_to_peak_uv: 1000.0
+
+features:
+  welch_nperseg_samples: 250
+  welch_noverlap_samples: 125
