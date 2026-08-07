@@ -1,11 +1,11 @@
 """Orchestration for virtual-glasses recording and replay runs."""
 
 from datetime import datetime, timezone
-import json
 import math
 from pathlib import Path
 from typing import Any
 
+from foundations.config import save_resolved_config
 from foundations.contracts import SceneFrame
 from foundations.events import Event, JsonlEventLogger
 from foundations.recording import HDF5Recorder, HDF5Replay
@@ -77,13 +77,6 @@ def _new_run_directory(output_root: str) -> Path:
     return run_directory
 
 
-def _save_resolved_config(config: dict[str, Any], run_directory: Path) -> None:
-    path = run_directory / "resolved_config.json"
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(config, handle, indent=2, sort_keys=True, allow_nan=False)
-        handle.write("\n")
-
-
 def run_virtual_glasses(config: dict[str, Any]) -> Path:
     """Execute one configured virtual-glasses recording or replay run."""
 
@@ -92,7 +85,7 @@ def run_virtual_glasses(config: dict[str, Any]) -> Path:
         raise FileNotFoundError(config["recording_path"])
 
     run_directory = _new_run_directory(config["output_root"])
-    _save_resolved_config(config, run_directory)
+    save_resolved_config(config, run_directory / "resolved_config.json")
     events = JsonlEventLogger(run_directory / "events.jsonl")
 
     if config["mode"] == "record":
