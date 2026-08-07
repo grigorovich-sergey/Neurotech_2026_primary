@@ -1,6 +1,7 @@
 """YAML configuration loading and strict partial overrides."""
 
 from copy import deepcopy
+import json
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,15 @@ def load_resolved_config(
     if override_path is None:
         return defaults
     return _merge_known(defaults, _load_yaml(override_path))
+
+
+def save_resolved_config(config: dict[str, Any], path: str | Path) -> None:
+    """Persist a fully resolved configuration using the project's JSON format."""
+
+    path = Path(path)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
 
 
 if __name__ == "__main__":
