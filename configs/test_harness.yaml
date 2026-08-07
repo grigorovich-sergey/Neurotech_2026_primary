@@ -1,0 +1,15 @@
+output_root: runs
+video_path: null
+gaze_interaction_config: null
+
+gaze:
+  mode: mouse
+  csv_input_path: null
+  mouse_csv_output_path: null
+
+playback:
+  paced: true
+
+visualization:
+  show_window: true
+  save_frames: false
