@@ -1,0 +1,18 @@
+mode: record
+output_root: runs
+seed: 42
+duration_seconds: 1.0
+
+scene:
+  width: 64
+  height: 48
+  rate_hz: 10.0
+  dropout_probability: 0.0
+
+gaze:
+  rate_hz: 30.0
+  invalid_probability: 0.0
+  dropout_probability: 0.0
+
+recording_path: null
+replay_paced: false
