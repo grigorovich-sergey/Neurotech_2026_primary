@@ -1,0 +1,43 @@
+output_root: runs
+checkpoint_filename: participant_state.pkl
+participant_id: synthetic-P001
+participant_sequence_index: 0
+seed: 42
+episodes: 2000
+sessions: 4
+
+timing:
+  minimum_prediction_elapsed_s: 0.25
+  eeg_window_s: 1.0
+  feedback_timeout_s: 1.5
+  episode_spacing_s: 2.0
+  outcome_delay_s: 0.2
+  button_delay_s: 0.2
+
+model:
+  learning_rate: 0.01
+  l2: 0.0
+  decision_threshold: 0.5
+
+synthetic:
+  eeg_quality_cycle:
+    - usable
+    - usable
+    - usable
+    - usable
+    - usable
+    - usable
+    - usable
+    - usable
+    - unavailable
+    - rejected
+  feedback_case_cycle:
+    - action_no_press
+    - action_press
+    - no_action_no_press
+    - no_action_press
+  controlled_trial_every_n: 10
+
+resume_check:
+  enabled: true
+  after_session: 2
