@@ -1,0 +1,47 @@
+output_root: runs
+
+participant:
+  id: integrated-P001
+  sequence_index: 0
+  checkpoint_path: runs/participants/integrated-P001.pkl
+  resume_checkpoint: true
+
+session:
+  id_prefix: integrated-session
+
+input:
+  mode: synthetic
+  record_glasses: true
+  video:
+    path: null
+    gaze_mode: file
+    gaze_csv_path: null
+    paced: true
+    show_window: true
+    save_frames: false
+
+feedback:
+  mode: synthetic
+  synthetic:
+    press_cycle:
+      - false
+      - true
+    press_delay_seconds: 0.2
+  replay:
+    events_path: null
+  keyboard:
+    key_code: 32
+
+synthetic_vision:
+  warmup_seconds: 1.1
+  visible_seconds: 1.5
+  blank_seconds: 1.75
+  label: synthetic-object
+
+analysis:
+  enabled: true
+
+subsystem_config_overrides:
+  gaze_interaction: configs/integration_gaze.yaml
+  eeg_pipeline: configs/integration_eeg.yaml
+  experiment_learning: null

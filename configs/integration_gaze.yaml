@@ -1,0 +1,7 @@
+# Partial override of the authoritative gaze_interaction.yaml for the default
+# hardware-free integrated verification run.
+source:
+  virtual:
+    duration_seconds: 12.0
+    scene_width: 160
+    scene_height: 120
