@@ -42,6 +42,20 @@ Scientific timestamps are float seconds relative to experiment/source start.
 The UTC run-directory name is only an output identifier and is not the
 scientific timebase.
 
+## Integrated pre-hardware experiment
+
+Run the complete gaze interaction + EEG + paired-learning path with deterministic
+synthetic inputs:
+
+```bash
+python scripts/run_integrated_experiment.py
+```
+
+The integrated runner also supports Foundation HDF5 replay and prerecorded video
+with CSV or mouse gaze. See [docs/instance_5_integration.md](docs/instance_5_integration.md)
+for input/feedback modes, configuration options, subsystem interfaces and ordering,
+outputs, offline analysis, and restart behavior.
+
 ## Tests
 
 ```bash

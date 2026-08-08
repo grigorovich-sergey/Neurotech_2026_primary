@@ -1,0 +1,5 @@
+# Partial override of the authoritative eeg_pipeline.yaml.  The longer source
+# covers the default integrated virtual-glasses timeline.
+source:
+  synthetic:
+    duration_seconds: 12.0
