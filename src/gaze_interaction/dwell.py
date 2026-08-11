@@ -33,6 +33,7 @@ class DwellState:
     accumulated_seconds: float
     required_seconds: float
     triggered: bool
+    trigger_pending: bool = False
 
     @property
     def progress(self) -> float:
@@ -86,6 +87,8 @@ class DwellController:
         self._last_matched_timestamp: float | None = None
         self._previous_sample_matched = False
         self._triggered = False
+        self._trigger_pending = False
+        self._pending_required_seconds: float | None = None
         self._last_update_timestamp: float | None = None
 
     def required_seconds(self, intent_score: float | None) -> float:
@@ -104,9 +107,12 @@ class DwellController:
         matched: bool,
         timestamp: float,
         intent_score: float | None = None,
+        trigger_gate_open: bool = True,
     ) -> tuple[DwellState, DwellTrigger | None]:
         if not isinstance(matched, bool):
             raise TypeError("matched must be a bool")
+        if not isinstance(trigger_gate_open, bool):
+            raise TypeError("trigger_gate_open must be a bool")
         if isinstance(timestamp, bool) or not isinstance(timestamp, Real):
             raise TypeError("timestamp must be a real number")
         timestamp_value = float(timestamp)
@@ -134,6 +140,8 @@ class DwellController:
             self._last_matched_timestamp = None
             self._previous_sample_matched = False
             self._triggered = False
+            self._trigger_pending = False
+            self._pending_required_seconds = None
 
         if not matched:
             self._previous_sample_matched = False
@@ -155,14 +163,36 @@ class DwellController:
         self._previous_sample_matched = True
 
         trigger: DwellTrigger | None = None
-        if not self._triggered and self._accumulated_seconds >= requirement:
+        trigger_requirement = requirement
+        if self._trigger_pending and trigger_gate_open:
+            if self._pending_required_seconds is None:
+                raise RuntimeError("pending dwell trigger has no stored requirement")
+            trigger_requirement = self._pending_required_seconds
+            self._trigger_pending = False
+            self._pending_required_seconds = None
             self._triggered = True
             trigger = DwellTrigger(
                 episode_id=episode.episode_id,
                 track_id=episode.track_id,
                 timestamp=timestamp_value,
-                required_seconds=requirement,
+                required_seconds=trigger_requirement,
             )
+        elif (
+            not self._triggered
+            and not self._trigger_pending
+            and self._accumulated_seconds >= requirement
+        ):
+            if trigger_gate_open:
+                self._triggered = True
+                trigger = DwellTrigger(
+                    episode_id=episode.episode_id,
+                    track_id=episode.track_id,
+                    timestamp=timestamp_value,
+                    required_seconds=requirement,
+                )
+            else:
+                self._trigger_pending = True
+                self._pending_required_seconds = requirement
         return self._state(requirement), trigger
 
     def _state(self, requirement: float) -> DwellState:
@@ -171,7 +201,17 @@ class DwellController:
             accumulated_seconds=self._accumulated_seconds,
             required_seconds=requirement,
             triggered=self._triggered,
+            trigger_pending=self._trigger_pending,
         )
+
+    def _cancel(self, timestamp: float) -> tuple[DwellState, bool]:
+        """Clear dwell state and report whether a pending trigger was discarded."""
+
+        discarded_pending_trigger = self._trigger_pending
+        state, trigger = self.advance(None, matched=False, timestamp=timestamp)
+        if trigger is not None:
+            raise RuntimeError("dwell cancellation cannot emit a trigger")
+        return state, discarded_pending_trigger
 
     def _reset_episode(self) -> None:
         self._episode_id = None
@@ -179,6 +219,8 @@ class DwellController:
         self._last_matched_timestamp = None
         self._previous_sample_matched = False
         self._triggered = False
+        self._trigger_pending = False
+        self._pending_required_seconds = None
 
 
 if __name__ == "__main__":

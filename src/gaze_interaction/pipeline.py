@@ -10,7 +10,7 @@ from foundations.contracts import GazeSample, SceneFrame
 from gaze_interaction.association import GazeAssociator
 from gaze_interaction.contracts import Detection, TrackedObject, TrackedScene
 from gaze_interaction.dwell import DwellController, DwellState, DwellTrigger
-from gaze_interaction.episodes import CandidateEpisode, EpisodeTracker
+from gaze_interaction.episodes import CandidateEpisode, EpisodeEndReason, EpisodeTracker
 
 
 class Detector(Protocol):
@@ -41,6 +41,15 @@ class InteractionUpdate:
     dwell_trigger: DwellTrigger | None
 
 
+@dataclass(frozen=True)
+class InteractionCancellation:
+    timestamp: float
+    reason: EpisodeEndReason
+    ended_episode: CandidateEpisode | None
+    dwell_state: DwellState
+    discarded_pending_trigger: bool
+
+
 class GazeInteractionPipeline:
     def __init__(
         self,
@@ -66,7 +75,11 @@ class GazeInteractionPipeline:
         return SceneUpdate(frame.timestamp, detections, tracked_scene.objects)
 
     def process_gaze(
-        self, gaze: GazeSample, *, intent_score: float | None = None
+        self,
+        gaze: GazeSample,
+        *,
+        intent_score: float | None = None,
+        trigger_gate_open: bool = True,
     ) -> InteractionUpdate:
         association = self.associator.associate(gaze)
         episode_update = self.episode_tracker.update(
@@ -83,6 +96,7 @@ class GazeInteractionPipeline:
             matched=matched,
             timestamp=float(gaze.timestamp),
             intent_score=intent_score,
+            trigger_gate_open=trigger_gate_open,
         )
         return InteractionUpdate(
             gaze=gaze,
@@ -92,6 +106,23 @@ class GazeInteractionPipeline:
             ended_episode=episode_update.ended_episode,
             dwell_state=dwell_state,
             dwell_trigger=dwell_trigger,
+        )
+
+    def cancel(
+        self, timestamp: float, reason: EpisodeEndReason
+    ) -> InteractionCancellation:
+        """Cancel current interaction state without emitting a dwell trigger."""
+
+        ended_episode = self.episode_tracker.cancel(timestamp, reason)
+        dwell_state, discarded_pending_trigger = self.dwell_controller._cancel(
+            timestamp
+        )
+        return InteractionCancellation(
+            timestamp=float(timestamp),
+            reason=reason,
+            ended_episode=ended_episode,
+            dwell_state=dwell_state,
+            discarded_pending_trigger=discarded_pending_trigger,
         )
 
     def finish(self, timestamp: float) -> CandidateEpisode | None:

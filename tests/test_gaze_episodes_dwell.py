@@ -118,11 +118,94 @@ def test_candidate_change_resets_dwell_state() -> None:
     dwell = _dwell(maximum_reduction_fraction=0.0)
     first = _episode(1, 1)
     second = _episode(2, 2)
-    dwell.advance(first, matched=True, timestamp=0.0)
-    dwell.advance(first, matched=True, timestamp=0.05)
+    dwell.advance(first, matched=True, timestamp=0.0, trigger_gate_open=False)
+    dwell.advance(first, matched=True, timestamp=0.1, trigger_gate_open=False)
+    pending, _ = dwell.advance(
+        first, matched=True, timestamp=0.2, trigger_gate_open=False
+    )
+    assert pending.trigger_pending
 
-    state, trigger = dwell.advance(second, matched=True, timestamp=0.06)
+    state, trigger = dwell.advance(
+        second, matched=True, timestamp=0.21, trigger_gate_open=True
+    )
 
     assert state.episode_id == 2
     assert state.accumulated_seconds == 0.0
+    assert not state.trigger_pending
     assert trigger is None
+
+
+def test_gated_dwell_crossing_is_pending_until_a_confirmed_release_update() -> None:
+    dwell = _dwell(maximum_reduction_fraction=0.0)
+    episode = _episode(1, 7)
+
+    dwell.advance(
+        episode, matched=True, timestamp=0.0, trigger_gate_open=False
+    )
+    dwell.advance(
+        episode, matched=True, timestamp=0.1, trigger_gate_open=False
+    )
+    pending, blocked_trigger = dwell.advance(
+        episode, matched=True, timestamp=0.2, trigger_gate_open=False
+    )
+
+    assert pending.accumulated_seconds == pytest.approx(0.2)
+    assert pending.trigger_pending
+    assert not pending.triggered
+    assert blocked_trigger is None
+
+    still_pending, no_match_trigger = dwell.advance(
+        episode, matched=False, timestamp=0.21, trigger_gate_open=True
+    )
+    assert still_pending.trigger_pending
+    assert no_match_trigger is None
+
+    released, trigger = dwell.advance(
+        episode, matched=True, timestamp=0.22, trigger_gate_open=True
+    )
+    assert released.triggered
+    assert not released.trigger_pending
+    assert trigger is not None
+    assert trigger.timestamp == pytest.approx(0.22)
+    assert trigger.required_seconds == pytest.approx(0.2)
+
+    _, repeated = dwell.advance(
+        episode, matched=True, timestamp=0.23, trigger_gate_open=True
+    )
+    assert repeated is None
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        EpisodeEndReason.FEEDBACK_INTERRUPTION,
+        EpisodeEndReason.SESSION_DURATION_REACHED,
+    ],
+)
+def test_explicit_cancellation_ends_episode_with_distinct_reason(
+    reason: EpisodeEndReason,
+) -> None:
+    episodes = EpisodeTracker(gap_grace_seconds=0.15)
+    candidate = _candidate(1)
+    first = episodes.update(candidate, 0.0).started_episode
+
+    ended = episodes.cancel(0.1, reason)
+
+    assert first is not None
+    assert ended is not None
+    assert ended.episode_id == first.episode_id
+    assert ended.end_timestamp == pytest.approx(0.1)
+    assert ended.end_reason == reason
+    assert episodes.active_episode is None
+
+    restarted = episodes.update(candidate, 0.2).started_episode
+    assert restarted is not None
+    assert restarted.episode_id > first.episode_id
+
+
+def test_explicit_cancellation_rejects_ordinary_episode_end_reasons() -> None:
+    episodes = EpisodeTracker(gap_grace_seconds=0.15)
+    episodes.update(_candidate(1), 0.0)
+
+    with pytest.raises(ValueError, match="cancellation reason"):
+        episodes.cancel(0.1, EpisodeEndReason.SOURCE_END)

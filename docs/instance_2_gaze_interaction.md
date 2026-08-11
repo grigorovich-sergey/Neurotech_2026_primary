@@ -64,6 +64,24 @@ matches for the same episode. Explicit no-match/invalid samples pause dwell and
 `max_sample_gap_seconds` prevents an unobserved long interval from being counted.
 Changing episodes resets dwell. At most one `DwellTrigger` is emitted per episode.
 
+Integration may pass `trigger_gate_open=False` to `DwellController.advance()` or
+`GazeInteractionPipeline.process_gaze()` while an earlier feedback target remains
+open. Dwell continues accumulating, but a threshold crossing becomes
+`DwellState.trigger_pending` and emits no action. If the same episode is still
+active when the gate reopens, the pending trigger is emitted exactly once on the
+next confirmed matching gaze update. Its timestamp is the release update's
+timestamp. No-match updates do not release it, and an episode end or candidate
+change discards it.
+
+`GazeInteractionPipeline.cancel(timestamp, reason)` explicitly ends and clears the
+current candidate, dwell, and pending-trigger state without fabricating a trigger.
+The reason must be `EpisodeEndReason.FEEDBACK_INTERRUPTION` or
+`EpisodeEndReason.SESSION_DURATION_REACHED`. It returns an
+`InteractionCancellation` containing the ended episode, cleared post-cancellation
+dwell state, and whether a pending trigger was discarded. Episode IDs remain
+run-unique after cancellation. Feedback attribution, session timing, and cooldown
+remain Integration responsibilities.
+
 The external `intent_score` is either `None` or a finite value in `[0, 1]`.
 Invalid scores are rejected. `None` uses baseline dwell. Otherwise the requirement
 is:
