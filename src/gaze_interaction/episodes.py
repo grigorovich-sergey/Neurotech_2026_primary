@@ -12,6 +12,14 @@ class EpisodeEndReason(str, Enum):
     CANDIDATE_CHANGE = "candidate_change"
     GAP_TIMEOUT = "gap_timeout"
     SOURCE_END = "source_end"
+    FEEDBACK_INTERRUPTION = "feedback_interruption"
+    SESSION_DURATION_REACHED = "session_duration_reached"
+
+
+_CANCELLATION_REASONS = {
+    EpisodeEndReason.FEEDBACK_INTERRUPTION,
+    EpisodeEndReason.SESSION_DURATION_REACHED,
+}
 
 
 def _valid_timestamp(name: str, value: float) -> float:
@@ -137,6 +145,23 @@ class EpisodeTracker:
                 EpisodeEndReason.GAP_TIMEOUT,
             )
         return self._end_active(timestamp_value, EpisodeEndReason.SOURCE_END)
+
+    def cancel(
+        self, timestamp: float, reason: EpisodeEndReason
+    ) -> CandidateEpisode | None:
+        """End the active episode for an external interruption or deadline."""
+
+        if not isinstance(reason, EpisodeEndReason):
+            raise TypeError("reason must be an EpisodeEndReason")
+        if reason not in _CANCELLATION_REASONS:
+            raise ValueError(
+                "cancellation reason must be feedback_interruption or "
+                "session_duration_reached"
+            )
+        timestamp_value = self._check_order(timestamp)
+        if self._active is None:
+            return None
+        return self._end_active(timestamp_value, reason)
 
     def _check_order(self, timestamp: float) -> float:
         value = _valid_timestamp("timestamp", timestamp)
