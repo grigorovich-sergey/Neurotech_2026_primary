@@ -15,6 +15,11 @@ def _finite_non_negative(name: str, value: float) -> None:
         raise ValueError(f"{name} must be finite and non-negative")
 
 
+def _optional_finite_non_negative(name: str, value: float | None) -> None:
+    if value is not None:
+        _finite_non_negative(name, value)
+
+
 def _validate_bounds(start: float, end: float) -> None:
     _finite_non_negative("requested_start", start)
     _finite_non_negative("requested_end", end)
@@ -45,6 +50,8 @@ class EEGSample:
     timestamp: float
     value_uv: float
     valid: bool = True
+    vendor_timestamp_unix: float | None = None
+    host_receipt_timestamp: float | None = None
 
     def __post_init__(self) -> None:
         _finite_non_negative("timestamp", self.timestamp)
@@ -54,6 +61,12 @@ class EEGSample:
             raise ValueError("value_uv must be finite")
         if not isinstance(self.valid, bool):
             raise TypeError("valid must be a bool")
+        _optional_finite_non_negative(
+            "vendor_timestamp_unix", self.vendor_timestamp_unix
+        )
+        _optional_finite_non_negative(
+            "host_receipt_timestamp", self.host_receipt_timestamp
+        )
 
 
 @dataclass(frozen=True)

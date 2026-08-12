@@ -6,8 +6,11 @@ feedback labels, and the learning models.
 
 ## Time and window contract
 
-`EEGSample(timestamp, value_uv, valid)` uses non-negative run-relative seconds and
-microvolts. `EEGBuffer.window(start, end)` uses a **closed `[start, end]` interval**;
+`EEGSample(timestamp, value_uv, valid, vendor_timestamp_unix,
+host_receipt_timestamp)` uses non-negative run-relative seconds and microvolts.
+The final two optional fields retain live-acquisition diagnostics; they are `None`
+for sources that do not provide them. `EEGBuffer.window(start, end)` uses a
+**closed `[start, end]` interval**;
 samples later than `end` are never returned or passed to preprocessing.
 
 `EEGWindow` reports the requested interval, actual first/last returned sample,
@@ -56,11 +59,14 @@ the run's saved resolved configuration.
 
 ## Raw recording and replay
 
-`EEGHDF5Recorder` writes `raw_eeg.h5` schema v1 before preprocessing. The file
-contains `timestamp`, `value_uv`, and `valid` datasets plus `schema_version`,
-`sample_rate_hz`, `timebase=run_relative_seconds`, and `value_units=microvolts`
-metadata. Missing samples remain absent. `EEGHDF5Replay` reconstructs the same
-ordered `EEGSample` values.
+`EEGHDF5Recorder` writes `raw_eeg.h5` schema v2 before preprocessing. The file
+contains `timestamp`, `value_uv`, `valid`, `vendor_timestamp_unix`, and
+`host_receipt_timestamp` datasets plus `schema_version`, `sample_rate_hz`,
+`timebase=run_relative_seconds`, and `value_units=microvolts` metadata. A NaN in
+either diagnostic timestamp dataset means unavailable and replays as `None`;
+missing samples remain absent. `EEGHDF5Replay` reads both schema v2 and legacy
+schema v1, reconstructing ordered `EEGSample` values without inventing legacy
+timing metadata.
 
 Run the hardware-independent default:
 
@@ -85,11 +91,21 @@ python -m pip install -e ".[guardian]"
 ```
 
 The adapter uses `idun-guardian-sdk==0.1.23` directly (no LSL), subscribes to
-`raw_eeg`, and maps each documented Guardian Unix timestamp as
-`guardian_unix_timestamp - experiment_start_unix`. The standalone runner captures
-the experiment origin after impedance preflight and immediately before recording
-when it is not supplied;
-a later integrated runner should provide the shared experiment origin.
+`raw_eeg`, and maps each documented Guardian Unix timestamp onto an injected host
+clock using one paired anchor:
+
+```text
+run_timestamp = anchor_run + guardian_unix_timestamp - anchor_unix
+```
+
+`GuardianAdapter(clock=clock.now, ...)` captures the anchor after impedance
+preflight and before recording. One host receipt timestamp is captured per SDK
+callback and attached to all raw samples in that callback. The standalone runner
+creates its own monotonic clock at that point. Integrated live operation must
+instead create one `foundations.timebase.MonotonicClock` at attempt start and pass
+that same clock's `now` callable to the Guardian adapter. Vendor timestamps remain
+the source of sensor sample time; callback order is not substituted for them.
+Backward or negative mapped timestamps remain hard errors.
 
 The default preflight uses the SDK impedance stream and requires the latest
 reading to be below the configured 300 kOhm threshold before recording. Realtime

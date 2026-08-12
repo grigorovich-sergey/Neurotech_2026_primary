@@ -1,11 +1,16 @@
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 
 from eeg_pipeline.buffer import EEGBuffer
 from eeg_pipeline.contracts import EEGSample, QualityState
-from eeg_pipeline.guardian import GuardianLiveParser, GuardianTimestampMapper
+from eeg_pipeline.guardian import (
+    GuardianAdapter,
+    GuardianLiveParser,
+    GuardianTimestampMapper,
+)
 from eeg_pipeline.pipeline import EEGPipeline
 from eeg_pipeline.processing import FEATURE_NAMES, EEGFeatureExtractor, EEGPreprocessor, EEGQualityGate
 from eeg_pipeline.recording import EEGHDF5Recorder, EEGHDF5Replay
@@ -35,9 +40,12 @@ def _tone_samples(duration: float = 2.0) -> list[EEGSample]:
 
 
 def test_guardian_timestamp_mapping_and_live_event_conversion() -> None:
-    mapper = GuardianTimestampMapper(1_700_000_000.0)
+    mapper = GuardianTimestampMapper(
+        anchor_run_timestamp=2.0,
+        anchor_unix_timestamp=1_700_000_000.0,
+    )
     samples: list[EEGSample] = []
-    parser = GuardianLiveParser(mapper, samples.append)
+    parser = GuardianLiveParser(mapper, samples.append, lambda: 2.25)
     parser(
         {
             "raw_eeg": [
@@ -47,11 +55,64 @@ def test_guardian_timestamp_mapping_and_live_event_conversion() -> None:
         }
     )
 
-    assert samples[0].timestamp == pytest.approx(0.004, abs=1e-6)
-    assert samples[1].timestamp == pytest.approx(0.008, abs=1e-6)
+    assert samples[0].timestamp == pytest.approx(2.004, abs=1e-6)
+    assert samples[1].timestamp == pytest.approx(2.008, abs=1e-6)
     assert [sample.value_uv for sample in samples] == [12.5, -3.0]
+    assert [sample.vendor_timestamp_unix for sample in samples] == [
+        1_700_000_000.004,
+        1_700_000_000.008,
+    ]
+    assert [sample.host_receipt_timestamp for sample in samples] == [2.25, 2.25]
     with pytest.raises(ValueError, match="backwards"):
         mapper.map(1_700_000_000.006)
+    with pytest.raises(ValueError, match="precedes"):
+        GuardianTimestampMapper(
+            anchor_run_timestamp=0.0,
+            anchor_unix_timestamp=1_700_000_000.0,
+        ).map(1_699_999_999.0)
+
+
+def test_guardian_adapter_injects_shared_clock_and_anchors_after_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    samples: list[EEGSample] = []
+    clock_values = iter((5.0, 5.25))
+
+    class FakeClient:
+        handler = None
+
+        def subscribe_live_insights(self, *, raw_eeg: bool, handler: object) -> None:
+            assert raw_eeg is True
+            self.handler = handler
+
+        async def start_recording(self, *, recording_timer: int) -> None:
+            assert recording_timer == 1
+            assert self.handler is not None
+            self.handler(
+                {"raw_eeg": [{"timestamp": 1_700_000_000.004, "ch1": 4.5}]}
+            )
+
+    client = FakeClient()
+    monkeypatch.setattr("eeg_pipeline.guardian.time.time", lambda: 1_700_000_000.0)
+    adapter = GuardianAdapter(
+        clock=lambda: next(clock_values),
+        client_factory=lambda **_: client,
+    )
+
+    adapter.run(
+        recording_seconds=1,
+        on_sample=samples.append,
+        impedance_preflight_seconds=None,
+    )
+
+    assert adapter.mapper is not None
+    assert adapter.mapper.anchor_run_timestamp == 5.0
+    assert adapter.mapper.anchor_unix_timestamp == 1_700_000_000.0
+    assert len(samples) == 1
+    assert samples[0].timestamp == pytest.approx(5.004, abs=1e-6)
+    assert samples[0].value_uv == 4.5
+    assert samples[0].vendor_timestamp_unix == 1_700_000_000.004
+    assert samples[0].host_receipt_timestamp == 5.25
 
 
 def test_window_is_closed_and_never_includes_sample_after_cutoff() -> None:
@@ -162,9 +223,21 @@ def test_known_alpha_tone_produces_stable_feature_order_and_dominant_alpha_power
 
 def test_raw_hdf5_round_trip_preserves_samples_and_validity(tmp_path: Path) -> None:
     original = [
-        EEGSample(0.0, 1.25, True),
+        EEGSample(
+            0.0,
+            1.25,
+            True,
+            vendor_timestamp_unix=1_700_000_000.0,
+            host_receipt_timestamp=0.02,
+        ),
         EEGSample(0.004, -2.5, False),
-        EEGSample(0.012, 3.75, True),
+        EEGSample(
+            0.012,
+            3.75,
+            True,
+            vendor_timestamp_unix=1_700_000_000.012,
+            host_receipt_timestamp=0.03,
+        ),
     ]
     path = tmp_path / "raw_eeg.h5"
     with EEGHDF5Recorder(path, sample_rate_hz=SAMPLE_RATE) as recorder:
@@ -174,6 +247,24 @@ def test_raw_hdf5_round_trip_preserves_samples_and_validity(tmp_path: Path) -> N
     replayed = list(EEGHDF5Replay(path).samples())
 
     assert replayed == original
+
+
+def test_schema_v1_replay_marks_timing_metadata_unavailable(tmp_path: Path) -> None:
+    path = tmp_path / "legacy_raw_eeg.h5"
+    with h5py.File(path, "w") as file:
+        file.attrs["schema_version"] = 1
+        file.attrs["sample_rate_hz"] = SAMPLE_RATE
+        file.attrs["timebase"] = "run_relative_seconds"
+        file.attrs["value_units"] = "microvolts"
+        file.create_dataset("timestamp", data=np.array([0.0, 0.004]))
+        file.create_dataset("value_uv", data=np.array([1.0, 2.0]))
+        file.create_dataset("valid", data=np.array([True, False]))
+
+    replayed = list(EEGHDF5Replay(path).samples())
+
+    assert replayed == [EEGSample(0.0, 1.0, True), EEGSample(0.004, 2.0, False)]
+    assert all(sample.vendor_timestamp_unix is None for sample in replayed)
+    assert all(sample.host_receipt_timestamp is None for sample in replayed)
 
 
 def test_repeated_replay_processing_is_deterministic(tmp_path: Path) -> None:
@@ -192,3 +283,23 @@ def test_repeated_replay_processing_is_deterministic(tmp_path: Path) -> None:
     assert results[0].quality_state is QualityState.USABLE
     assert results[1].quality_state is QualityState.USABLE
     np.testing.assert_array_equal(results[0].values, results[1].values)
+
+
+def test_synthetic_hdf5_replay_preserves_features(tmp_path: Path) -> None:
+    original_pipeline = _pipeline()
+    replay_pipeline = _pipeline()
+    path = tmp_path / "raw_eeg.h5"
+    with EEGHDF5Recorder(path, sample_rate_hz=SAMPLE_RATE) as recorder:
+        for sample in _tone_samples(2.0):
+            original_pipeline.add_sample(sample)
+            recorder.record(sample)
+    for sample in EEGHDF5Replay(path).samples():
+        replay_pipeline.add_sample(sample)
+
+    original = original_pipeline.features(0.0, 2.0)
+    replayed = replay_pipeline.features(0.0, 2.0)
+
+    assert original.quality_state is QualityState.USABLE
+    assert replayed.quality_state is QualityState.USABLE
+    assert original.feature_names == replayed.feature_names
+    np.testing.assert_array_equal(original.values, replayed.values)

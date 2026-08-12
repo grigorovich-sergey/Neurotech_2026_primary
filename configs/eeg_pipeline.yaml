@@ -17,7 +17,6 @@ source:
     address: null
     api_token_env: IDUN_API_TOKEN
     debug: false
-    experiment_start_unix: null
     recording_seconds: 2
     impedance:
       enabled: true

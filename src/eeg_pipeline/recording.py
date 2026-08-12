@@ -12,7 +12,8 @@ import numpy as np
 from eeg_pipeline.contracts import EEGSample
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+LEGACY_SCHEMA_VERSION = 1
 TIMEBASE = "run_relative_seconds"
 VALUE_UNITS = "microvolts"
 
@@ -44,6 +45,12 @@ class EEGHDF5Recorder:
         self._file.create_dataset("timestamp", shape=(0,), maxshape=(None,), dtype=np.float64)
         self._file.create_dataset("value_uv", shape=(0,), maxshape=(None,), dtype=np.float64)
         self._file.create_dataset("valid", shape=(0,), maxshape=(None,), dtype=np.bool_)
+        self._file.create_dataset(
+            "vendor_timestamp_unix", shape=(0,), maxshape=(None,), dtype=np.float64
+        )
+        self._file.create_dataset(
+            "host_receipt_timestamp", shape=(0,), maxshape=(None,), dtype=np.float64
+        )
         self._last_timestamp: float | None = None
 
     def __enter__(self) -> "EEGHDF5Recorder":
@@ -67,29 +74,80 @@ class EEGHDF5Recorder:
         _append(self._file["timestamp"], sample.timestamp)
         _append(self._file["value_uv"], sample.value_uv)
         _append(self._file["valid"], sample.valid)
+        _append(
+            self._file["vendor_timestamp_unix"],
+            np.nan
+            if sample.vendor_timestamp_unix is None
+            else sample.vendor_timestamp_unix,
+        )
+        _append(
+            self._file["host_receipt_timestamp"],
+            np.nan
+            if sample.host_receipt_timestamp is None
+            else sample.host_receipt_timestamp,
+        )
         self._last_timestamp = float(sample.timestamp)
 
 
 class EEGHDF5Replay:
-    """Replay raw EEG samples exactly as stored in schema v1."""
+    """Replay raw EEG samples from current schema v2 or legacy schema v1."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
 
+    @staticmethod
+    def _optional_timestamp(
+        dataset: h5py.Dataset, index: int, name: str
+    ) -> float | None:
+        value = float(dataset[index])
+        if math.isnan(value):
+            return None
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"EEG recording {name} contains an invalid value")
+        return value
+
     def samples(self) -> Iterator[EEGSample]:
         with h5py.File(self.path, "r") as file:
-            if file.attrs.get("schema_version") != SCHEMA_VERSION:
+            schema_version = int(file.attrs.get("schema_version", -1))
+            if schema_version not in {LEGACY_SCHEMA_VERSION, SCHEMA_VERSION}:
                 raise ValueError("unsupported EEG recording schema version")
             if file.attrs.get("timebase") != TIMEBASE:
                 raise ValueError("unsupported EEG recording timebase")
             timestamps = file["timestamp"]
             values = file["value_uv"]
             validity = file["valid"]
-            if not (len(timestamps) == len(values) == len(validity)):
+            datasets = [timestamps, values, validity]
+            vendor_timestamps: h5py.Dataset | None = None
+            receipt_timestamps: h5py.Dataset | None = None
+            if schema_version == SCHEMA_VERSION:
+                vendor_timestamps = file["vendor_timestamp_unix"]
+                receipt_timestamps = file["host_receipt_timestamp"]
+                datasets.extend((vendor_timestamps, receipt_timestamps))
+            if len({len(dataset) for dataset in datasets}) != 1:
                 raise ValueError("EEG recording datasets have inconsistent lengths")
             last_timestamp: float | None = None
-            for timestamp, value, valid in zip(timestamps, values, validity, strict=True):
-                sample = EEGSample(float(timestamp), float(value), bool(valid))
+            for index in range(len(timestamps)):
+                vendor_timestamp = (
+                    None
+                    if vendor_timestamps is None
+                    else self._optional_timestamp(
+                        vendor_timestamps, index, "vendor_timestamp_unix"
+                    )
+                )
+                receipt_timestamp = (
+                    None
+                    if receipt_timestamps is None
+                    else self._optional_timestamp(
+                        receipt_timestamps, index, "host_receipt_timestamp"
+                    )
+                )
+                sample = EEGSample(
+                    float(timestamps[index]),
+                    float(values[index]),
+                    bool(validity[index]),
+                    vendor_timestamp_unix=vendor_timestamp,
+                    host_receipt_timestamp=receipt_timestamp,
+                )
                 if last_timestamp is not None and sample.timestamp < last_timestamp:
                     raise ValueError("EEG recording timestamps are not non-decreasing")
                 last_timestamp = float(sample.timestamp)

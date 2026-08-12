@@ -12,17 +12,17 @@ from eeg_pipeline.contracts import EEGSample
 
 
 class GuardianTimestampMapper:
-    """Map Guardian Unix seconds into the shared run-relative timebase."""
+    """Map Guardian Unix seconds onto an integration-owned run-relative clock."""
 
-    def __init__(self, experiment_start_unix: float) -> None:
-        if (
-            isinstance(experiment_start_unix, bool)
-            or not isinstance(experiment_start_unix, Real)
-            or not math.isfinite(float(experiment_start_unix))
-            or experiment_start_unix < 0
-        ):
-            raise ValueError("experiment_start_unix must be finite and non-negative")
-        self.experiment_start_unix = float(experiment_start_unix)
+    def __init__(
+        self, *, anchor_run_timestamp: float, anchor_unix_timestamp: float
+    ) -> None:
+        self.anchor_run_timestamp = _host_timestamp(
+            "anchor_run_timestamp", anchor_run_timestamp
+        )
+        self.anchor_unix_timestamp = _host_timestamp(
+            "anchor_unix_timestamp", anchor_unix_timestamp
+        )
         self._last_relative: float | None = None
 
     def map(self, guardian_unix_timestamp: float) -> float:
@@ -32,7 +32,9 @@ class GuardianTimestampMapper:
             or not math.isfinite(float(guardian_unix_timestamp))
         ):
             raise ValueError("Guardian timestamp must be finite")
-        relative = float(guardian_unix_timestamp) - self.experiment_start_unix
+        relative = self.anchor_run_timestamp + (
+            float(guardian_unix_timestamp) - self.anchor_unix_timestamp
+        )
         if relative < 0:
             raise ValueError("Guardian timestamp precedes the experiment origin")
         if self._last_relative is not None and relative < self._last_relative:
@@ -48,9 +50,13 @@ class GuardianLiveParser:
         self,
         mapper: GuardianTimestampMapper,
         on_sample: Callable[[EEGSample], None],
+        host_clock: Callable[[], float],
     ) -> None:
+        if not callable(host_clock):
+            raise TypeError("host_clock must be callable")
         self.mapper = mapper
         self.on_sample = on_sample
+        self.host_clock = host_clock
 
     def __call__(self, event: Any) -> None:
         message = getattr(event, "message", event)
@@ -59,18 +65,35 @@ class GuardianLiveParser:
         raw_eeg = message.get("raw_eeg")
         if not isinstance(raw_eeg, list):
             raise ValueError("Guardian live event is missing raw_eeg samples")
+        host_receipt_timestamp = _host_timestamp(
+            "host receipt timestamp", self.host_clock()
+        )
         for raw_sample in raw_eeg:
             if not isinstance(raw_sample, Mapping):
                 raise ValueError("Guardian raw_eeg entries must be mappings")
             if "timestamp" not in raw_sample or "ch1" not in raw_sample:
                 raise ValueError("Guardian raw_eeg entries require timestamp and ch1")
+            vendor_timestamp_unix = raw_sample["timestamp"]
             self.on_sample(
                 EEGSample(
-                    timestamp=self.mapper.map(raw_sample["timestamp"]),
+                    timestamp=self.mapper.map(vendor_timestamp_unix),
                     value_uv=raw_sample["ch1"],
                     valid=True,
+                    vendor_timestamp_unix=vendor_timestamp_unix,
+                    host_receipt_timestamp=host_receipt_timestamp,
                 )
             )
+
+
+def _host_timestamp(name: str, value: float) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, Real)
+        or not math.isfinite(float(value))
+        or value < 0
+    ):
+        raise ValueError(f"{name} must be finite and non-negative")
+    return float(value)
 
 
 class GuardianAdapter:
@@ -79,7 +102,7 @@ class GuardianAdapter:
     def __init__(
         self,
         *,
-        experiment_start_unix: float | None,
+        clock: Callable[[], float],
         address: str | None = None,
         api_token: str | None = None,
         debug: bool = False,
@@ -91,12 +114,10 @@ class GuardianAdapter:
             raise ValueError("Guardian api_token must be a non-empty string or None")
         if not isinstance(debug, bool):
             raise TypeError("debug must be a bool")
-        self.experiment_start_unix = experiment_start_unix
-        self.mapper = (
-            GuardianTimestampMapper(experiment_start_unix)
-            if experiment_start_unix is not None
-            else None
-        )
+        if not callable(clock):
+            raise TypeError("clock must be callable")
+        self.clock = clock
+        self.mapper: GuardianTimestampMapper | None = None
         if client_factory is None:
             try:
                 module = importlib.import_module("idun_guardian_sdk")
@@ -168,10 +189,13 @@ class GuardianAdapter:
                 max_impedance_ohms=max_impedance_ohms,
                 mains_frequency_hz=mains_frequency_hz,
             )
-        if self.mapper is None:
-            self.experiment_start_unix = time.time()
-            self.mapper = GuardianTimestampMapper(self.experiment_start_unix)
-        parser = GuardianLiveParser(self.mapper, on_sample)
+        anchor_run_timestamp = _host_timestamp("clock timestamp", self.clock())
+        anchor_unix_timestamp = _host_timestamp("Unix timestamp", time.time())
+        self.mapper = GuardianTimestampMapper(
+            anchor_run_timestamp=anchor_run_timestamp,
+            anchor_unix_timestamp=anchor_unix_timestamp,
+        )
+        parser = GuardianLiveParser(self.mapper, on_sample, self.clock)
         self.client.subscribe_live_insights(raw_eeg=True, handler=parser)
         await self.client.start_recording(recording_timer=recording_seconds)
         return impedance
@@ -203,5 +227,7 @@ class GuardianAdapter:
 
 
 if __name__ == "__main__":
-    mapper = GuardianTimestampMapper(1_700_000_000.0)
+    mapper = GuardianTimestampMapper(
+        anchor_run_timestamp=2.0, anchor_unix_timestamp=1_700_000_000.0
+    )
     print(mapper.map(1_700_000_000.004))
