@@ -12,7 +12,7 @@ from typing import Mapping
 from experiment_learning.contracts import Condition
 
 
-SCHEDULE_FIELDS = ("sequence_id", "session_number", "condition")
+SCHEDULE_FIELDS = ("sequence_id", "session_number", "active_condition")
 
 
 @dataclass(frozen=True)
@@ -67,9 +67,11 @@ def load_condition_schedule(path: str | Path) -> ConditionSchedule:
         if session_number <= 0 or str(session_number) != row["session_number"].strip():
             raise ValueError(f"session_number must be a positive integer on CSV line {line_number}")
         try:
-            condition = Condition((row.get("condition") or "").strip())
+            condition = Condition((row.get("active_condition") or "").strip())
         except ValueError as exc:
-            raise ValueError(f"condition must be G or E on CSV line {line_number}") from exc
+            raise ValueError(
+                f"active_condition must be G or E on CSV line {line_number}"
+            ) from exc
         key = (sequence_id, session_number)
         if key in rows:
             raise ValueError(f"duplicate schedule row for {sequence_id} session {session_number}")

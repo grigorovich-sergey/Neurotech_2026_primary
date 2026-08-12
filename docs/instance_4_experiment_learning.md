@@ -79,7 +79,7 @@ participant data exist.
 `load_condition_schedule(path)` reads an approved CSV with exactly these columns:
 
 ```csv
-sequence_id,session_number,condition
+sequence_id,session_number,active_condition
 g-first,1,G
 g-first,2,E
 ```
