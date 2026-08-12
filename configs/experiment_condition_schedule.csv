@@ -1,4 +1,4 @@
-sequence_id,session_number,condition
+sequence_id,session_number,active_condition
 g-first,1,G
 g-first,2,E
 g-first,3,G

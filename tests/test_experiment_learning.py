@@ -184,19 +184,48 @@ def test_policy_artifact_is_immutable_strict_and_maps_dwell_conservatively(tmp_p
 def test_schedule_is_predetermined_and_digest_binding_rejects_mutation(tmp_path: Path) -> None:
     path = tmp_path / "schedule.csv"
     path.write_text(
-        "sequence_id,session_number,condition\nseq-a,1,G\nseq-a,2,E\n",
+        "sequence_id,session_number,active_condition\nseq-a,1,G\nseq-a,2,E\n",
         encoding="utf-8",
     )
     first = load_condition_schedule(path)
     resolved = resolve_scheduled_condition(first, "seq-a", 2)
     assert resolved.condition is Condition.E
     path.write_text(
-        "sequence_id,session_number,condition\nseq-a,1,E\nseq-a,2,G\n",
+        "sequence_id,session_number,active_condition\nseq-a,1,E\nseq-a,2,G\n",
         encoding="utf-8",
     )
     changed = load_condition_schedule(path)
     with pytest.raises(ValueError, match="persisted"):
         resolve_scheduled_condition(changed, "seq-a", 2, resolved.binding)
+
+
+def test_schedule_rejects_legacy_condition_header(tmp_path: Path) -> None:
+    path = tmp_path / "schedule.csv"
+    path.write_text(
+        "sequence_id,session_number,condition\nseq-a,1,G\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="condition schedule header must be exactly: "
+        "sequence_id,session_number,active_condition",
+    ):
+        load_condition_schedule(path)
+
+
+def test_schedule_names_active_condition_in_value_error(tmp_path: Path) -> None:
+    path = tmp_path / "schedule.csv"
+    path.write_text(
+        "sequence_id,session_number,active_condition\nseq-a,1,X\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="active_condition must be G or E on CSV line 2",
+    ):
+        load_condition_schedule(path)
 
 
 def test_eeg_decision_uses_only_scalar_index_and_freezes_without_runtime_mutation() -> None:
