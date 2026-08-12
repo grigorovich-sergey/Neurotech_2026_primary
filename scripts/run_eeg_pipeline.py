@@ -16,6 +16,7 @@ from eeg_pipeline.processing import EEGFeatureExtractor, EEGPreprocessor, EEGQua
 from eeg_pipeline.recording import EEGHDF5Recorder, EEGHDF5Replay
 from eeg_pipeline.synthetic import synthetic_eeg_samples
 from foundations.config import load_resolved_config, save_resolved_config
+from foundations.timebase import MonotonicClock
 
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "eeg_pipeline.yaml"
@@ -164,8 +165,16 @@ def run_eeg_pipeline(config: dict[str, Any]) -> Path:
         else:
             guardian = source["guardian"]
             api_token = os.environ.get(guardian["api_token_env"])
+            standalone_clock: MonotonicClock | None = None
+
+            def standalone_clock_now() -> float:
+                nonlocal standalone_clock
+                if standalone_clock is None:
+                    standalone_clock = MonotonicClock()
+                return standalone_clock.now()
+
             adapter = GuardianAdapter(
-                experiment_start_unix=guardian["experiment_start_unix"],
+                clock=standalone_clock_now,
                 address=guardian["address"],
                 api_token=api_token,
                 debug=guardian["debug"],
@@ -180,9 +189,6 @@ def run_eeg_pipeline(config: dict[str, Any]) -> Path:
                 max_impedance_ohms=impedance["max_ohms"],
                 mains_frequency_hz=impedance["mains_frequency_hz"],
             )
-            if guardian["experiment_start_unix"] is None:
-                guardian["experiment_start_unix"] = adapter.experiment_start_unix
-                save_resolved_config(resolved, run_directory / "resolved_config.json")
     finally:
         if recorder is not None:
             recorder.close()
