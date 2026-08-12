@@ -210,6 +210,17 @@ class _ThreadSafeEvents:
             self._logger.log(Event(float(timestamp), name, payload))
 
 
+class _TerminalReporter:
+    """Serialize concise operator-facing notices from the main and worker threads."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def report(self, timestamp: float, message: str) -> None:
+        with self._lock:
+            print(f"[practice {float(timestamp):8.3f}s] {message}", flush=True)
+
+
 class _JsonlWriter:
     def __init__(self, path: Path) -> None:
         self._handle = path.open("w", encoding="utf-8")
@@ -473,6 +484,57 @@ def _overlay_status(image_rgb: Any, lines: list[str], *, selection: str | None) 
     return image
 
 
+def _overlay_gaze_indicator(image_rgb: Any, gaze: GazeSample | None) -> Any:
+    """Draw a high-contrast practice-only bullseye for the latest valid gaze."""
+
+    image = image_rgb.copy()
+    if (
+        gaze is None
+        or not gaze.valid
+        or gaze.x_normalized is None
+        or gaze.y_normalized is None
+    ):
+        return image
+    height, width = image.shape[:2]
+    point = (
+        int(round(gaze.x_normalized * (width - 1))),
+        int(round(gaze.y_normalized * (height - 1))),
+    )
+    cv2.circle(image, point, 18, (0, 0, 0), 6, cv2.LINE_AA)
+    cv2.circle(image, point, 18, (255, 60, 255), 3, cv2.LINE_AA)
+    cv2.drawMarker(
+        image,
+        point,
+        (255, 255, 255),
+        markerType=cv2.MARKER_CROSS,
+        markerSize=28,
+        thickness=2,
+        line_type=cv2.LINE_AA,
+    )
+    label_position = (min(point[0] + 22, max(0, width - 48)), max(14, point[1] - 20))
+    cv2.putText(
+        image,
+        "GAZE",
+        label_position,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (0, 0, 0),
+        3,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        image,
+        "GAZE",
+        label_position,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    return image
+
+
 def run_practice_session(
     config: dict[str, Any],
     *,
@@ -496,6 +558,7 @@ def run_practice_session(
     save_resolved_config(eeg_config, run_directory / "resolved_eeg_pipeline_config.json")
 
     events = _ThreadSafeEvents(run_directory / "events.jsonl")
+    terminal = _TerminalReporter()
     state = _RunState()
     diagnostics = _Diagnostics()
     processing = resolved["processing"]
@@ -536,10 +599,15 @@ def run_practice_session(
     intentional_close = threading.Event()
 
     def fail(reason: str, exc: BaseException) -> None:
+        timestamp = clock.now()
         events.log(
-            clock.now(),
+            timestamp,
             "practice_error",
             {"source": reason, "error": type(exc).__name__},
+        )
+        terminal.report(
+            timestamp,
+            f"ERROR {reason}: {type(exc).__name__}: {exc}",
         )
         state.request_stop(reason, exc)
 
@@ -662,24 +730,28 @@ def run_practice_session(
             on_disconnect=on_disconnect,
         )
         connection = mindlink_config["connection"]
-        print("Connecting to MindLink...")
+        terminal.report(clock.now(), "connecting to MindLink")
         adapter.connect(
             connect_timeout_seconds=connection["connect_timeout_seconds"],
             tracker_ready_timeout_seconds=connection["tracker_ready_timeout_seconds"],
         )
-        events.log(clock.now(), "practice_mindlink_connected", {})
+        connected_at = clock.now()
+        events.log(connected_at, "practice_mindlink_connected", {})
+        terminal.report(connected_at, "MindLink connected")
         calibration = mindlink_config["calibration"]
-        print("Running MindLink calibration...")
+        terminal.report(clock.now(), "starting MindLink calibration")
         calibration_result = adapter.calibrate(
             marker_size_mm=calibration["marker_size_mm"],
             returning_user=calibration["returning_user"],
             timeout_seconds=calibration["timeout_seconds"],
         )
+        calibrated_at = clock.now()
         events.log(
-            clock.now(),
+            calibrated_at,
             "practice_mindlink_calibrated",
             {"result": repr(calibration_result)},
         )
+        terminal.report(calibrated_at, "MindLink calibration complete")
 
         if eeg_monitor is not None:
             guardian = eeg_config["source"]["guardian"]
@@ -725,6 +797,7 @@ def run_practice_session(
                 name="practice_guardian",
                 daemon=True,
             )
+            terminal.report(clock.now(), "starting Guardian EEG monitor")
             guardian_thread.start()
 
         if display["enabled"]:
@@ -737,7 +810,7 @@ def run_practice_session(
             on_gaze_metadata=on_gaze_metadata,
         )
         events.log(capture_started_at, "practice_capture_started", {})
-        print("Practice session running. Press Q or Esc to stop.")
+        terminal.report(capture_started_at, "capture started; press Q or Esc to stop")
 
         while not state.stop.is_set():
             now = clock.now()
@@ -783,6 +856,13 @@ def run_practice_session(
                         "practice_selection",
                         {"track_id": trigger.track_id, "label": selection_label},
                     )
+                    terminal.report(
+                        trigger.timestamp,
+                        (
+                            f"SELECTION triggered: {selection_label} "
+                            f"(track {trigger.track_id})"
+                        ),
+                    )
 
             if (
                 eeg_monitor is not None
@@ -800,6 +880,7 @@ def run_practice_session(
             ):
                 warned_no_frame = True
                 events.log(now, "practice_no_frame_warning", {})
+                terminal.report(now, "WARNING no scene frame received")
 
             if display["enabled"] and latest_frame is not None:
                 snapshot = diagnostics.snapshot()
@@ -825,6 +906,16 @@ def run_practice_session(
                         f"{snapshot['gaze_queue_drops']}"
                     ),
                 ]
+                if latest_gaze is None:
+                    lines.append("gaze indicator: waiting for sample")
+                elif latest_gaze.valid:
+                    lines.append(
+                        "gaze indicator: VALID | "
+                        f"x={latest_gaze.x_normalized:.3f} "
+                        f"y={latest_gaze.y_normalized:.3f}"
+                    )
+                else:
+                    lines.append("gaze indicator: INVALID / outside image")
                 if eeg_monitor is None:
                     lines.append("EEG: off")
                 else:
@@ -843,6 +934,7 @@ def run_practice_session(
                     dwell_state=(latest_interaction.dwell_state if latest_interaction else None),
                     intent_score=None,
                 )
+                image = _overlay_gaze_indicator(image, latest_gaze)
                 selection = selection_label if now <= selection_until else None
                 image = _overlay_status(image, lines, selection=selection)
                 cv2.imshow(display["window_name"], cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
@@ -903,7 +995,9 @@ def run_practice_session(
         if capture_started_at is None
         else max(0.0, completed_at - capture_started_at)
     )
-    rate_denominator = capture_duration if capture_duration and capture_duration > 0 else None
+    rate_denominator = (
+        capture_duration if capture_duration and capture_duration > 0 else None
+    )
     stream_rates_hz = {
         "scene_received": (
             None
@@ -952,6 +1046,13 @@ def run_practice_session(
             "reason": summary["stop_reason"],
             "successful": summary["successful"],
         },
+    )
+    terminal.report(
+        completed_at,
+        (
+            f"stopped: {summary['stop_reason']} | "
+            f"successful={summary['successful']} | artifacts={run_directory}"
+        ),
     )
 
     if state.failure is not None:

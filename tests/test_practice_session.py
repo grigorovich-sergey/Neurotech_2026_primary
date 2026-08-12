@@ -9,7 +9,11 @@ from foundations.config import load_resolved_config
 from foundations.contracts import GazeSample, SceneFrame
 from gaze_interaction.contracts import BoundingBox, Detection, TrackedObject, TrackedScene
 from mindlink import FrameMetadata, GazeMetadata
-from practice_session.runner import PROJECT_ROOT, run_practice_session
+from practice_session.runner import (
+    PROJECT_ROOT,
+    _overlay_gaze_indicator,
+    run_practice_session,
+)
 
 
 PRACTICE_CONFIG = PROJECT_ROOT / "configs" / "practice_session.yaml"
@@ -108,7 +112,9 @@ def _events(path: Path) -> list[dict]:
     ]
 
 
-def test_practice_runs_live_gaze_path_without_experimental_artifacts(tmp_path: Path) -> None:
+def test_practice_runs_live_gaze_path_without_experimental_artifacts(
+    tmp_path: Path, capsys
+) -> None:
     instances: list[FakeMindLink] = []
 
     def mindlink_factory(**kwargs) -> FakeMindLink:
@@ -155,6 +161,28 @@ def test_practice_runs_live_gaze_path_without_experimental_artifacts(tmp_path: P
     assert (run / "mindlink_gaze_metadata.jsonl").is_file()
     assert not any("completed_session" in path.name for path in run.iterdir())
     assert not any("policy" in path.name or "training" in path.name for path in run.iterdir())
+    terminal = capsys.readouterr().out
+    assert "SELECTION triggered: cup (track 1)" in terminal
+    assert "stopped: duration_reached | successful=True" in terminal
+
+
+def test_practice_gaze_indicator_is_visible_and_does_not_mutate_input() -> None:
+    source = np.zeros((80, 120, 3), dtype=np.uint8)
+    valid = GazeSample(0.0, 0.5, 0.5, True, None)
+
+    rendered = _overlay_gaze_indicator(source, valid)
+
+    assert np.array_equal(source, np.zeros_like(source))
+    assert not np.array_equal(rendered, source)
+    center = rendered[40, 60]
+    assert center.max() > 0
+
+
+def test_practice_gaze_indicator_omits_invalid_gaze() -> None:
+    source = np.zeros((80, 120, 3), dtype=np.uint8)
+    invalid = GazeSample(0.0, None, None, False, None)
+
+    assert np.array_equal(_overlay_gaze_indicator(source, invalid), source)
 
 
 def test_optional_eeg_uses_shared_clock_and_stops_with_practice(
