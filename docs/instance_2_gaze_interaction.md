@@ -12,6 +12,22 @@ Ultralytics may resolve/download weights; importing the package never downloads 
 model. Foundation scene frames are RGB, so the adapter explicitly converts them to
 the BGR ndarray convention expected at the Ultralytics prediction boundary.
 
+The default detector confidence threshold is `0.45`. Immediately after YOLOE
+inference, the configured category allowlist maps nuanced raw labels onto stable
+project categories; rejected detections never reach ByteTrack, gaze association,
+dwell, or diagnostics. Matching is case-insensitive and token/phrase-aware, so
+`office chair` matches `chair`, `Apple iPad` maps to `tablet`, and a term such as
+`can` can match `soda can` without matching `candle`. When several terms match, the
+longest (most specific) term wins and category order breaks equal-length ties.
+
+The default categories are `chair`, `laptop`, `cellphone`, `tablet`, and
+`wall poster`. Each category has configurable label terms in
+`detector.category_filter.categories`. Accepted detections use the canonical
+category `name` as their downstream label. Set `category_filter.enabled: false` to
+retain all labels above the confidence threshold. Because lists are replaced
+wholesale by the project configuration merger, an override of `categories` must
+contain the complete desired list.
+
 Detector boxes are clipped to the image, degenerate boxes are discarded, and the
 local `BoundingBox` uses normalized `[0, 1]` coordinates with origin at top-left,
 `+x` right, and `+y` down. `ByteTrackAdapter` uses Supervision's ByteTrack and its

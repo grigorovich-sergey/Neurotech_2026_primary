@@ -235,6 +235,7 @@ def _build_gaze_pipeline(
             confidence_threshold=detector_config["confidence_threshold"],
             image_size=detector_config["image_size"],
             device=detector_config["device"],
+            category_filter=detector_config["category_filter"],
         )
         tracker = ByteTrackAdapter(
             activation_threshold=tracker_config["activation_threshold"],
