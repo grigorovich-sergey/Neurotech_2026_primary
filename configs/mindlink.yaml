@@ -1,0 +1,17 @@
+output_root: runs
+
+connection:
+  connect_timeout_seconds: 5.0
+  tracker_ready_timeout_seconds: 15.0
+
+calibration:
+  marker_size_mm: 35
+  returning_user: false
+  timeout_seconds: 120.0
+
+capture:
+  frame_queue_size: 2
+
+smoke_demo:
+  window_name: AdHawk scene camera + gaze
+  no_frame_warning_seconds: 3.0
