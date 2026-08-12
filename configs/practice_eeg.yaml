@@ -1,0 +1,9 @@
+# Live Guardian practice override for the authoritative EEG-pipeline defaults.
+source:
+  mode: live
+  guardian:
+    recording_seconds: 36000
+
+window:
+  start_seconds: 0.0
+  end_seconds: 2.0

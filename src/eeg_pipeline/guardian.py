@@ -11,6 +11,13 @@ from typing import Any
 from eeg_pipeline.contracts import EEGSample
 
 
+_STOP_POLL_SECONDS = 0.05
+
+
+class _StopRequested(Exception):
+    """Internal control flow for a cooperative acquisition stop."""
+
+
 class GuardianTimestampMapper:
     """Map Guardian Unix seconds onto an integration-owned run-relative clock."""
 
@@ -134,6 +141,7 @@ class GuardianAdapter:
         duration_seconds: float,
         max_impedance_ohms: float,
         mains_frequency_hz: int,
+        stop_requested: Callable[[], bool] | None,
     ) -> float:
         if duration_seconds <= 0:
             raise ValueError("impedance duration_seconds must be positive")
@@ -159,10 +167,17 @@ class GuardianAdapter:
             )
         )
         try:
-            await asyncio.sleep(float(duration_seconds))
+            deadline = asyncio.get_running_loop().time() + float(duration_seconds)
+            while True:
+                if stop_requested is not None and stop_requested():
+                    raise _StopRequested
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0.0:
+                    break
+                await asyncio.sleep(min(_STOP_POLL_SECONDS, remaining))
         finally:
             self.client.stop_impedance()
-        await task
+            await task
         if not readings:
             raise RuntimeError("Guardian impedance preflight returned no readings")
         impedance = readings[-1]
@@ -181,14 +196,21 @@ class GuardianAdapter:
         impedance_preflight_seconds: float | None,
         max_impedance_ohms: float,
         mains_frequency_hz: int,
+        stop_requested: Callable[[], bool] | None,
     ) -> float | None:
+        if stop_requested is not None and stop_requested():
+            return None
         impedance: float | None = None
         if impedance_preflight_seconds is not None:
-            impedance = await self._impedance_preflight(
-                duration_seconds=impedance_preflight_seconds,
-                max_impedance_ohms=max_impedance_ohms,
-                mains_frequency_hz=mains_frequency_hz,
-            )
+            try:
+                impedance = await self._impedance_preflight(
+                    duration_seconds=impedance_preflight_seconds,
+                    max_impedance_ohms=max_impedance_ohms,
+                    mains_frequency_hz=mains_frequency_hz,
+                    stop_requested=stop_requested,
+                )
+            except _StopRequested:
+                return None
         anchor_run_timestamp = _host_timestamp("clock timestamp", self.clock())
         anchor_unix_timestamp = _host_timestamp("Unix timestamp", time.time())
         self.mapper = GuardianTimestampMapper(
@@ -197,7 +219,39 @@ class GuardianAdapter:
         )
         parser = GuardianLiveParser(self.mapper, on_sample, self.clock)
         self.client.subscribe_live_insights(raw_eeg=True, handler=parser)
-        await self.client.start_recording(recording_timer=recording_seconds)
+        recording_task = asyncio.create_task(
+            self.client.start_recording(recording_timer=recording_seconds)
+        )
+        if stop_requested is None:
+            await recording_task
+            return impedance
+
+        async def wait_for_stop() -> None:
+            while not stop_requested():
+                await asyncio.sleep(_STOP_POLL_SECONDS)
+
+        stop_task = asyncio.create_task(wait_for_stop())
+        try:
+            done, _ = await asyncio.wait(
+                (recording_task, stop_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if recording_task in done:
+                await recording_task
+            else:
+                stop_task.result()
+                recording_task.cancel()
+                try:
+                    await recording_task
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            if not stop_task.done():
+                stop_task.cancel()
+            await asyncio.gather(stop_task, return_exceptions=True)
+            if not recording_task.done():
+                recording_task.cancel()
+                await asyncio.gather(recording_task, return_exceptions=True)
         return impedance
 
     def run(
@@ -208,6 +262,7 @@ class GuardianAdapter:
         impedance_preflight_seconds: float | None = 2.0,
         max_impedance_ohms: float = 300_000.0,
         mains_frequency_hz: int = 60,
+        stop_requested: Callable[[], bool] | None = None,
     ) -> float | None:
         if (
             isinstance(recording_seconds, bool)
@@ -215,6 +270,8 @@ class GuardianAdapter:
             or recording_seconds <= 0
         ):
             raise ValueError("recording_seconds must be a positive integer")
+        if stop_requested is not None and not callable(stop_requested):
+            raise TypeError("stop_requested must be callable or None")
         return asyncio.run(
             self._run_async(
                 recording_seconds=recording_seconds,
@@ -222,6 +279,7 @@ class GuardianAdapter:
                 impedance_preflight_seconds=impedance_preflight_seconds,
                 max_impedance_ohms=max_impedance_ohms,
                 mains_frequency_hz=mains_frequency_hz,
+                stop_requested=stop_requested,
             )
         )
 

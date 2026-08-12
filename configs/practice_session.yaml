@@ -1,0 +1,31 @@
+output_root: runs
+maximum_duration_seconds: 3600.0
+
+eeg:
+  enabled: false
+
+recording:
+  glasses_enabled: false
+  eeg_enabled: true
+
+processing:
+  scene_queue_size: 1
+  gaze_queue_size: 2048
+  gaze_batch_size: 64
+  idle_sleep_seconds: 0.005
+  eeg_status_window_seconds: 2.0
+  eeg_status_refresh_seconds: 0.5
+
+diagnostics:
+  write_mindlink_metadata: true
+
+display:
+  enabled: true
+  window_name: NeuroTech practice session
+  selection_banner_seconds: 1.0
+  no_frame_warning_seconds: 3.0
+
+subsystem_config_overrides:
+  mindlink: null
+  gaze_interaction: configs/practice_gaze.yaml
+  eeg_pipeline: configs/practice_eeg.yaml

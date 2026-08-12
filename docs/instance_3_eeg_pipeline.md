@@ -111,3 +111,9 @@ The default preflight uses the SDK impedance stream and requires the latest
 reading to be below the configured 300 kOhm threshold before recording. Realtime
 IDUN Quality Score predictions are not required. Live Guardian acquisition has
 not been hardware-verified in the implementation environment.
+
+Callers that need operator-controlled shutdown may pass
+`stop_requested=stop_event.is_set` to `GuardianAdapter.run(...)`. The adapter
+polls that callback during impedance preflight and recording. A stop during
+recording cancels and awaits the SDK recording coroutine so its own cleanup can
+finish; omitting the callback preserves the original duration-based behavior.
