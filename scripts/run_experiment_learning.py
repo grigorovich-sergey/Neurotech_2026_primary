@@ -1,4 +1,4 @@
-"""Run the deterministic hardware-free Instance 4 learning/state-machine stress workflow."""
+"""Run frozen Instance 4 policies and deterministic between-session retraining."""
 
 import argparse
 from pathlib import Path

@@ -15,7 +15,6 @@ dependencies = [
     "opencv-python>=4.8",
     "supervision>=0.25,<0.31",
     "ultralytics>=8.4",
-    "river==0.22.0",
 ]
 
 [project.optional-dependencies]
