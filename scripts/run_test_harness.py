@@ -69,6 +69,7 @@ def _build_pipeline(config: dict[str, Any]) -> GazeInteractionPipeline:
             confidence_threshold=detector["confidence_threshold"],
             image_size=detector["image_size"],
             device=detector["device"],
+            category_filter=detector["category_filter"],
         ),
         tracker=ByteTrackAdapter(
             activation_threshold=tracker["activation_threshold"],

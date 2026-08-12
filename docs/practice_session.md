@@ -4,6 +4,12 @@ This diagnostic checks the complete live glasses path without creating an
 experimental session or training input. It runs MindLink calibration, fresh
 post-calibration scene capture, canonical gaze, YOLOE/ByteTrack, gaze association,
 and fixed gaze-only dwell. Guardian EEG can be enabled as a monitor-only source.
+Practice inherits the gaze-interaction detector defaults: a `0.45` confidence
+threshold and the category allowlist for chair, laptop, cellphone, tablet, and wall
+poster. Only accepted categories are tracked, displayed, and eligible for a
+practice selection. Edit the terms or replace the category list through the
+configured gaze-interaction override when pilot observations expose different
+YOLOE wording.
 
 Before launch, start the AdHawk Backend Service and use the same vendor SDK setup
 as the MindLink smoke runner. For EEG, install the Guardian extra and export the

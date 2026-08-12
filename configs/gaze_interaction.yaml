@@ -17,9 +17,22 @@ source:
 
 detector:
   model: yoloe-26n-seg-pf.pt
-  confidence_threshold: 0.25
+  confidence_threshold: 0.45
   image_size: 640
   device: cpu
+  category_filter:
+    enabled: true
+    categories:
+      - name: chair
+        terms: [chair, armchair]
+      - name: laptop
+        terms: [laptop, notebook computer]
+      - name: cellphone
+        terms: [cell phone, cellphone, mobile phone, smartphone, smart phone]
+      - name: tablet
+        terms: [ipad, tablet, tablet computer]
+      - name: wall poster
+        terms: [wall poster, poster, placard]
 
 tracker:
   activation_threshold: 0.25
