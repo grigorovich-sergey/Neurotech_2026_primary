@@ -42,19 +42,35 @@ Scientific timestamps are float seconds relative to experiment/source start.
 The UTC run-directory name is only an output identifier and is not the
 scientific timebase.
 
-## Integrated pre-hardware experiment
+## Integrated pre-hardware experiment — temporarily unavailable
 
-Run the complete gaze interaction + EEG + paired-learning path with deterministic
-synthetic inputs:
+The checked-in integrated runner still targets the superseded online-learning API
+and currently fails during import. Do not use it for experiments until the
+schedule/frozen-policy/session integration rewrite is complete. The command below
+is retained only to identify the affected entry point:
 
 ```bash
 python scripts/run_integrated_experiment.py
 ```
 
-The integrated runner also supports Foundation HDF5 replay and prerecorded video
-with CSV or mouse gaze. See [docs/instance_5_integration.md](docs/instance_5_integration.md)
-for input/feedback modes, configuration options, subsystem interfaces and ordering,
-outputs, offline analysis, and restart behavior.
+The existing [Instance 5 integration document](docs/instance_5_integration.md)
+describes that obsolete implementation and is not a current experimental runbook.
+Subsystem runners and the live hardware practice mode below remain available.
+
+## Live hardware practice
+
+Run the MindLink calibration and diagnostic display without creating an
+experimental session or training input:
+
+```bash
+python scripts/run_practice_session.py
+python scripts/run_practice_session.py --with-eeg
+```
+
+Guardian EEG is optional and monitor-only; it never changes practice dwell.
+Press `Q` or `Esc` to stop. See
+[docs/practice_session.md](docs/practice_session.md) for setup, displayed
+diagnostics, artifacts, and current hardware-validation limitations.
 
 ## Tests
 

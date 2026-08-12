@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import h5py
@@ -113,6 +114,105 @@ def test_guardian_adapter_injects_shared_clock_and_anchors_after_preflight(
     assert samples[0].value_uv == 4.5
     assert samples[0].vendor_timestamp_unix == 1_700_000_000.004
     assert samples[0].host_receipt_timestamp == 5.25
+
+
+def test_guardian_adapter_cooperatively_stops_and_awaits_cleanup() -> None:
+    calls = 0
+
+    class FakeClient:
+        started = False
+        cleaned = False
+
+        def subscribe_live_insights(self, *, raw_eeg: bool, handler: object) -> None:
+            assert raw_eeg is True
+
+        async def start_recording(self, *, recording_timer: int) -> None:
+            self.started = True
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cleaned = True
+
+    def stop_requested() -> bool:
+        nonlocal calls
+        calls += 1
+        return calls >= 2
+
+    client = FakeClient()
+    adapter = GuardianAdapter(clock=lambda: 0.0, client_factory=lambda **_: client)
+
+    adapter.run(
+        recording_seconds=60,
+        on_sample=lambda _: None,
+        impedance_preflight_seconds=None,
+        stop_requested=stop_requested,
+    )
+
+    assert client.started
+    assert client.cleaned
+
+
+def test_guardian_adapter_stops_during_impedance_preflight() -> None:
+    calls = 0
+
+    class FakeClient:
+        impedance_running = False
+        impedance_stopped = False
+        recording_started = False
+
+        async def stream_impedance(
+            self, *, mains_freq_60hz: bool, handler: object
+        ) -> None:
+            self.impedance_running = True
+            while self.impedance_running:
+                await asyncio.sleep(0)
+
+        def stop_impedance(self) -> None:
+            self.impedance_running = False
+            self.impedance_stopped = True
+
+        async def start_recording(self, *, recording_timer: int) -> None:
+            self.recording_started = True
+
+    def stop_requested() -> bool:
+        nonlocal calls
+        calls += 1
+        return calls >= 3
+
+    client = FakeClient()
+    adapter = GuardianAdapter(clock=lambda: 0.0, client_factory=lambda **_: client)
+
+    adapter.run(
+        recording_seconds=60,
+        on_sample=lambda _: None,
+        impedance_preflight_seconds=10.0,
+        stop_requested=stop_requested,
+    )
+
+    assert client.impedance_stopped
+    assert not client.recording_started
+
+
+def test_guardian_adapter_propagates_recording_failure_with_stop_callback() -> None:
+    class FakeClient:
+        def subscribe_live_insights(self, *, raw_eeg: bool, handler: object) -> None:
+            assert raw_eeg is True
+
+        async def start_recording(self, *, recording_timer: int) -> None:
+            raise RuntimeError("recording failed")
+
+    adapter = GuardianAdapter(
+        clock=lambda: 0.0,
+        client_factory=lambda **_: FakeClient(),
+    )
+
+    with pytest.raises(RuntimeError, match="recording failed"):
+        adapter.run(
+            recording_seconds=1,
+            on_sample=lambda _: None,
+            impedance_preflight_seconds=None,
+            stop_requested=lambda: False,
+        )
 
 
 def test_window_is_closed_and_never_includes_sample_after_cutoff() -> None:
