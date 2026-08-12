@@ -25,12 +25,17 @@ Press `Q` or `Esc` in the display to stop. The same integration-owned
 cooperative: the practice stop signal cancels and awaits the SDK recording task so
 its cleanup can finish.
 
-The display includes recognized objects, gaze, current candidate, fixed dwell,
+The display includes recognized objects, a high-contrast labelled gaze bullseye,
+current gaze validity/coordinates, current candidate, fixed dwell,
 selection banners, separate received- and processed-scene rates, gaze rate and
 validity, frame/processing drops, and optional EEG rate/quality. EEG never changes
 practice dwell. The configured 30 Hz ByteTrack rate is provisional: tune it together
 with the lost-track buffer and association age after measuring the effective
 processed-scene rate on the target computer.
+
+The terminal prints timestamped lifecycle notices plus selection triggers, no-frame
+warnings, failures, and the final stop reason/artifact directory. It deliberately
+does not print every frame or gaze sample.
 
 Artifacts are written below `runs/practice/<run-id>/`. They are deliberately outside
 the participant/session hierarchy and never include a completed-session record,
