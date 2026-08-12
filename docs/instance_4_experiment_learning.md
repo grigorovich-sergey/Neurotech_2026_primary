@@ -1,284 +1,376 @@
-# Instance 4 — Experimental logic + parallel learning
+# Instance 4: frozen session policies and between-session learning
 
-`experiment_learning` owns the participant-specific G-versus-E experiment state
-machine. It consumes Instance 2 candidate/dwell contracts and Instance 3
-`EEGFeatureWindow` values; it does not reproduce gaze association, dwell
-accumulation, EEG preprocessing, or quality gating.
+`experiment_learning` owns the participant-specific G-versus-E experimental
+policy, feedback attribution, scientific episode records, predetermined condition
+schedule, and deterministic training between sessions.
 
-The scientific order is fixed:
+This is the corrected design. It replaces the earlier River online learners,
+mutable pickle checkpoint, and parity-allocated schedule. Nothing learns or
+changes policy parameters during a session.
 
-```text
-candidate -> freeze G and E -> active-only dwell control -> action/no action
-          -> feedback/timeout -> one common label -> score both -> update both
-```
+## Experimental distinction
 
-## Prediction and EEG timing
+Both conditions use one participant-specific gaze dwell threshold, `T_G`.
 
-Each eligible candidate gets at most one frozen paired prediction. The cutoff is
-the timestamp of the first confirmed matched gaze observation satisfying both:
+- **G** uses `T_G` unchanged.
+- **E** may shorten `T_G` from one frozen EEG decision for the episode.
+- EEG never identifies the object, creates an action, lengthens dwell, or lowers
+  dwell below the policy's `minimum_e_threshold_s`.
+- Missing/invalid EEG falls back behaviorally to `T_G` in both conditions and
+  excludes the episode from paired training.
 
-1. `timestamp >= episode.start_timestamp + minimum_prediction_elapsed_s`
-   (default `0.25 s`), and
-2. a full non-negative `eeg_window_s` history can be requested (default `1.0 s`).
+The session policy is loaded from one immutable JSON artifact. The active and
+shadow outcomes are reconstructed from the same recorded gaze trajectory after
+the feedback label is known. Training occurs once, after a successful session,
+and writes the next session's policy.
 
-Thus an episode beginning at run time `4.00 s` can first predict at `4.25 s`, and
-its EEG request is the closed interval `[3.25, 4.25]`. An episode beginning at
-run time `0.00 s` cannot predict at `0.25 s`; the earliest possible cutoff is
-`1.00 s`, because `[cutoff - 1.0, cutoff]` must stay inside the run timebase.
+## EEG enters the model as one variable
 
-The EEG window always ends exactly at the prediction cutoff. It may contain
-pre-candidate EEG; this is intentional because EEG is treated as slow context,
-not as a brain-click signal. Samples later than the cutoff are prohibited.
-
-If Instance 3 reports `UNAVAILABLE`, `REJECTED`, or no feature vector when the
-eligible request is made, the whole pair is unavailable: G and E both expose no
-model-derived dwell score, neither predicts/scores/updates, baseline Instance 2
-dwell is used, and the episode is never retried. This paired-complete-case rule
-is fixed for the comparison; zero fill, carry-forward, and G-only training are
-not runtime options.
-
-## Model features
-
-G uses exactly seven features in this order:
-
-| Feature | Meaning / units |
-| --- | --- |
-| `candidate_elapsed_s` | Cutoff minus candidate start, seconds |
-| `matched_dwell_s` | Instance 2 accumulated confirmed-match dwell, seconds |
-| `gaze_center_dx_norm` | Gaze x minus candidate-box center x, normalized scene units |
-| `gaze_center_dy_norm` | Gaze y minus candidate-box center y, normalized scene units |
-| `candidate_width_norm` | Candidate-box width, normalized scene units |
-| `candidate_height_norm` | Candidate-box height, normalized scene units |
-| `candidate_area_norm` | Normalized width × height |
-
-E is those same seven features followed by Instance 3's eight features, unchanged
-and in its published order:
+Instance 3 still returns all eight features in its fixed order, and every episode
+record retains them. The current regression input is only this engagement index:
 
 ```text
-std_uv
-peak_to_peak_uv
-mean_abs_diff_uv
-delta_power_1_4_hz
-theta_power_4_8_hz
-alpha_power_8_13_hz
-beta_power_13_30_hz
-low_gamma_power_30_40_hz
+beta_power_13_30_hz / (alpha_power_8_13_hz + theta_power_4_8_hz)
 ```
 
-Object/track identity, object label, absolute session time, detector confidence,
-and gaze confidence are not model features. A prediction requires a confirmed
-current match, so gaze features are not imputed.
-
-G and E are independent River `StandardScaler -> LogisticRegression` pipelines.
-Both begin with neutral `P(intent=1) = 0.5`. The returned score is that probability
-in `[0, 1]`; `0.5` is the default binary scoring threshold. Each model owns its
-own scaler and learned weights.
-
-## Instance 5 integration workflow
-
-The current Instance 2 API accepts `intent_score` before it returns the
-`InteractionUpdate` from which Instance 4 constructs the current observation.
-Therefore a score frozen on gaze update N begins controlling dwell on update
-N+1. This one-sample boundary is explicit rather than hidden.
-
-For each gaze sample, use this order:
-
-1. call Instance 2 with the last frozen active score (or `None`);
-2. tell Instance 4 about an ended episode and/or `DwellTrigger` from that update;
-3. build `GazeContextObservation` from the `InteractionUpdate`;
-4. ask Instance 4 to consider/fetch the paired prediction using the EEG pipeline;
-5. retain only the returned `decision.intent_score` for the next gaze update;
-6. route physical feedback presses to `button_press(timestamp)` and call
-   `advance_time(timestamp)` from the experiment timer so silence can time out.
-
-Example skeleton:
+The exact formula is intentionally isolated in
+`src/experiment_learning/eeg_indicator.py`:
 
 ```python
-from experiment_learning.features import observation_from_interaction
-
-held_score = None
-
-for gaze in gaze_stream:
-    update = gaze_pipeline.process_gaze(gaze, intent_score=held_score)
-
-    # Close/open previous experimental state before considering a new candidate.
-    if update.ended_episode is not None:
-        experiment.on_episode_end(update.ended_episode)
-    if update.dwell_trigger is not None:
-        experiment.on_dwell_trigger(update.dwell_trigger)
-
-    observation = observation_from_interaction(update)
-    if observation is not None and update.active_episode is not None:
-        decision = experiment.consider_prediction(
-            update.active_episode,
-            observation,
-            eeg_pipeline,  # exposes .features(start, end) -> EEGFeatureWindow
-            instructed_intention=current_trial_instruction,
-        )
-        held_score = decision.intent_score
-    elif update.active_episode is None:
-        held_score = None
-
-    experiment.advance_time(float(gaze.timestamp))
+def engagement_index(eeg_features):
+    beta = eeg_features["beta_power_13_30_hz"]
+    alpha = eeg_features["alpha_power_8_13_hz"]
+    theta = eeg_features["theta_power_4_8_hz"]
+    denominator = alpha + theta
+    if denominator <= 0.0:
+        raise InvalidEEGIndicator("alpha power + theta power must be positive")
+    return beta / denominator
 ```
 
-If a candidate switches, `consider_prediction` for the new episode returns
-`None` until its own eligibility cutoff, so the old score is not retained for
-the new episode. During a temporary no-match gap the previous score can remain
-held; Instance 2 does not accumulate dwell while the match is absent.
+There is no hidden epsilon, clipping, component-wise logarithm, or independent
+coefficient for any of the eight original features. To test another scientific
+formula later, change this small module and give the new formula a new identifier;
+the original feature values retained in episode records allow deterministic
+retraining without reprocessing raw EEG.
 
-There is one edge case worth preserving in integration: if Instance 2 emits a
-`DwellTrigger` on the same update before a paired prediction has ever been frozen,
-call `on_dwell_trigger` before `consider_prediction`. Instance 4 marks that episode
-`action_before_prediction` and never trains it. This prevents a baseline action
-from being retrospectively scored as model-controlled.
+The participant-specific frozen model is:
 
-### Active versus shadow output
+```text
+z = (engagement_index - mean) / scale
+P_EEG = sigmoid(intercept + coefficient * z)
+evidence = max(0, 2 * P_EEG - 1)
+T_E = max(minimum_E, T_G * (1 - reduction_fraction * evidence))
+```
 
-Both models predict on a usable eligible episode. `PredictionRecord` stores both
-probabilities, but `PredictionDecision.intent_score` is copied only from the
-session's active `Condition.G` or `Condition.E` model. No method exposes a combined
-G/E control score. `None` means Instance 2 should use its baseline dwell rule.
+With `T_G=1.0`, `reduction_fraction=0.4`, and `minimum_E=0.35`:
 
-## Feedback workflow
+| `P_EEG` | Evidence | E dwell |
+| ---: | ---: | ---: |
+| 0.30 | 0.00 | 1.00 s |
+| 0.50 | 0.00 | 1.00 s |
+| 0.75 | 0.50 | 0.80 s |
+| 1.00 | 1.00 | 0.60 s |
 
-An action opens its feedback window at `DwellTrigger.timestamp`. A predicted
-episode that ends without a trigger opens a no-action feedback window at its
-`CandidateEpisode.end_timestamp`. The default window is half-open
-`[open, open + 1.5 s)`: a press exactly at the deadline is too late and the case
-has already timed out.
+Session 1 sets the reduction to zero, so G and E behave identically before any
+participant data exist.
 
-| Visible outcome | Press before deadline | Common label |
+## Predetermined condition schedule
+
+`load_condition_schedule(path)` reads an approved CSV with exactly these columns:
+
+```csv
+sequence_id,session_number,condition
+g-first,1,G
+g-first,2,E
+```
+
+The loader verifies unique, contiguous session rows and computes SHA-256 over the
+exact CSV bytes. `resolve_scheduled_condition(...)` binds the sequence ID and CSV
+digest. A later edit to the CSV fails against a persisted binding instead of
+silently changing a participant's assignment.
+
+```python
+from experiment_learning.schedule import (
+    load_condition_schedule,
+    resolve_scheduled_condition,
+)
+
+schedule = load_condition_schedule("configs/experiment_condition_schedule.csv")
+scheduled = resolve_scheduled_condition(
+    schedule,
+    sequence_id="g-first",
+    session_number=2,
+    persisted_binding=prior_binding,
+)
+assert scheduled.condition.value == "E"
+```
+
+A failed attempt does not advance the schedule. A retry must resolve the same
+session number and load the policy using the artifact digest saved when the
+attempt began. `load_frozen_policy(..., expected_sha256=...)` enforces this even
+if a newer policy file exists elsewhere.
+
+## Runtime workflow
+
+For one successful attempt, Instance 5 should:
+
+1. load the approved schedule and resolve the condition with its persisted digest;
+2. load the participant policy for the exact session and saved artifact digest;
+3. construct Instance 2's `DwellController` from
+   `policy.dwell_parameters(active_condition)`;
+4. process each gaze update with the held episode score from the preceding update;
+5. pass `trigger_gate_open=controller.action_gate_open` to Instance 2;
+6. process an ended episode or visible action before evaluating the current new
+   episode update;
+7. call `evaluate_update(...)` on every confirmed matched observation so the
+   dwell trajectory begins before the EEG cutoff;
+8. route announcements to `open_action_feedback(...)`, natural eligible silence
+   to `open_no_action_feedback(...)`, presses to `accept_feedback(...)`, and time
+   progression to `advance_time(...)`;
+9. apply returned cancellation instructions through Instance 2's typed
+   `cancel(..., FEEDBACK_INTERRUPTION)` path and enforce the experiment cooldown;
+10. cancel remaining state at the session deadline, then create and persist the
+    completed-session artifact;
+11. call `train_next_session_policy(...)` exactly once and use its output only in
+    the next successful session number.
+
+Current Instance 2 applies a newly returned score on the following gaze update.
+That N-to-N+1 ordering remains intentional: the EEG cutoff cannot influence dwell
+already accumulated on update N.
+
+### Core construction example
+
+```python
+from experiment_learning.policy import load_frozen_policy
+from experiment_learning.schedule import ScheduleBinding
+from experiment_learning.state_machine import ExperimentController
+
+policy = load_frozen_policy(
+    "runs/P017/policy_session_003.json",
+    expected_participant_id="P017",
+    expected_session=3,
+    expected_sha256=attempt_policy_digest,
+)
+
+controller = ExperimentController(
+    policy=policy,
+    policy_sha256=attempt_policy_digest,
+    session_id="P017-S003",
+    session_number=3,
+    attempt_id="P017-S003-attempt-01",
+    active_condition=scheduled.condition,
+    schedule_binding=ScheduleBinding(
+        policy.schedule_sequence_id,
+        policy.schedule_sha256,
+    ),
+    minimum_prediction_elapsed_s=0.25,
+    eeg_window_s=1.0,
+    feedback_timeout_s=1.5,
+    event_logger=events,
+)
+```
+
+### Per-gaze example
+
+```python
+# held_score came from the previous confirmed update.
+interaction = gaze_pipeline.process_gaze(
+    gaze,
+    intent_score=held_score,
+    trigger_gate_open=controller.action_gate_open,
+)
+
+if interaction.ended_episode is not None:
+    controller.open_no_action_feedback(
+        interaction.ended_episode,
+        interaction.ended_episode.end_timestamp,
+    )
+
+if interaction.dwell_trigger is not None:
+    announce_object(interaction.dwell_trigger.episode_id)
+    controller.open_action_feedback(
+        interaction.dwell_trigger.episode_id,
+        display_timestamp=interaction.dwell_trigger.timestamp,
+    )
+
+observation = observation_from_interaction(interaction)
+if observation is not None and interaction.active_episode is not None:
+    decision = controller.evaluate_update(
+        interaction.active_episode,
+        observation,
+        eeg_pipeline,
+        instructed_intention=current_trial_instruction,
+    )
+    held_score = decision.intent_score
+```
+
+## Causal cutoff and missing EEG
+
+The first confirmed match at or after `episode_start + 0.25 s` is eligible once a
+full non-negative one-second history exists. Instance 4 requests exactly the closed
+interval `[cutoff - 1.0 s, cutoff]` and freezes that episode's result. It never
+retries, carries a previous result forward, or uses later EEG.
+
+Unavailable, rejected, incomplete, invalid-formula, or wrong-signature EEG:
+
+- returns `intent_score=None`, which means G-threshold behavioral fallback;
+- keeps the original quality state/reasons and any available original features;
+- excludes both G and E from paired training;
+- still opens feedback after a visible announcement so it can be corrected;
+- does not create a silent/no-action button target, because that label would enter
+  a scientifically ineligible example.
+
+## Feedback and newer candidates
+
+Feedback uses the fixed half-open window `[outcome, outcome + timeout)`:
+
+| Visible outcome | Press | Common label |
 | --- | --- | ---: |
 | Action | No | 1 |
 | Action | Yes | 0 |
 | No action | No | 0 |
 | No action | Yes | 1 |
 
-Only one feedback window can be open. An episode that begins while another
-episode's feedback is pending is suppressed for its whole lifetime. Presses with
-no open window or at/after the deadline are ignored and logged.
+Only one earlier target can be open, but newer gaze candidates continue to
+accumulate provisional dwell while its trigger gate is closed.
 
-Both frozen predictions are scored against the common label before either model
-updates. `ScoredPredictions` must be materialized before the paired learner accepts
-an update, making update-before-score difficult to perform accidentally.
+- An accepted press finalizes the earlier target and returns typed cancellation
+  instructions for every newer provisional episode.
+- A timeout finalizes the earlier target and simply reopens the gate; it does not
+  cancel a still-valid newer candidate.
+- `cancel_episode(...)` records explicit exclusion provenance for feedback or
+  session-deadline cancellation.
+- Controlled-intention trials retain both instructed intention and feedback label,
+  but are evaluation-only and excluded by the trainer.
 
-Controlled trials pass `instructed_intention=0|1` at prediction time. That value is
-recorded separately in `EpisodeResultRecord`; it never replaces the feedback label
-used for training. Example: a controlled trial may record
-`instructed_intention=0` and `common_label=1`, which is precisely the disagreement
-needed later to evaluate feedback-label reliability.
+## Episode records and censoring
 
-## Session schedule and participant checkpoints
+Every resolved/canceled episode emits `experiment_episode_training_record` with
+schema `experiment_episode_training_record_v1`. It includes:
 
-`SessionSchedule(participant_sequence_index=N)` uses sequence-index parity rather
-than randomness:
+- participant/session/attempt/episode identities and active condition;
+- frozen policy digest and causal EEG interval;
+- all eight original Instance 3 features;
+- engagement-index identifier, human-readable formula, value, probability, and
+  positive-only evidence;
+- compact `(timestamp, accumulated_matched_dwell_s)` trajectory;
+- actual display or natural endpoint and feedback fields;
+- common label, controlled intention, G/E required dwell and outcomes;
+- exclusion and cancellation lineage.
+
+When the active policy displays an action, behavior after display is contaminated.
+The record therefore ends its scientific trajectory there. A shadow threshold that
+did not cross within that prefix is `counterfactual_censored`, not a fabricated
+no-action. The trainer never invents post-announcement gaze continuation.
+
+After a successful attempt, `controller.completed_session(timestamp)` creates
+`experiment_completed_session_v1`. Failed/incomplete attempts are not trainer
+inputs and do not advance the schedule.
+
+## Deterministic between-session trainer
+
+`train_next_session_policy(completed_sessions, prior_policy, output_path, config)`:
+
+- requires successful sessions `1..N` for exactly one participant;
+- rejects duplicate sessions/episodes, cross-participant data, schedule drift,
+  lineage drift, and old schemas;
+- excludes controlled, canceled, unusable-EEG, missing-label, or otherwise marked
+  episodes with counts in the report;
+- standardizes only the scalar engagement index;
+- fits `intercept + coefficient*z` by balanced binary cross-entropy with
+  configurable L2, deterministic SciPy L-BFGS-B, and exact zero initialization;
+- searches G base thresholds first (`0.50..1.50 s`, step `0.05 s`), then searches
+  reductions (`0.0..0.5`) while holding the chosen base fixed;
+- requires at least 20 evaluated examples and 5 from each label class for fitting
+  and for every censor-aware candidate;
+- writes a carried-forward next artifact when data or fit stability is insufficient.
+
+The selection objective is:
 
 ```text
-even N: G, E, G, E, ...
-odd  N: E, G, E, G, ...
+2.0 * false positives
++ 1.0 * false negatives
++ 0.25 * mean true-positive latency in seconds
 ```
 
-Call `allocate_next()` once when a session is committed. The synthetic runner
-saves immediately after allocation so a resume does not silently reuse the same
-schedule slot.
+Tie-breaking is lower loss, fewer false positives, fewer misses, lower latency,
+closest to the prior policy, then the safer higher base or smaller reduction.
+Precision, recall, F1, counts, censoring, latency, full candidate tables, source
+digests, and deterministic ordering are retained in
+`experiment_training_report_v1`.
 
-Participant checkpoints are trusted-local standard-library pickle files. They
-contain both River pipelines/scalers, G/E training counters, participant ID,
-feature signature, model configuration, River version, and schedule state.
-`ExperimentController` atomically saves after every finalized trained episode;
-call `save_session_checkpoint()` again at session end.
+There is no trainer seed because there is no stochastic training step.
 
-Resume example:
+## Immutable artifacts
 
-```python
-from experiment_learning.checkpoint import load_participant_checkpoint
-from experiment_learning.models import ModelConfig
+`experiment_policy_v1` records participant/session lineage, schedule digest,
+source attempt digests, G threshold, EEG formula/signature, normalization,
+one-variable logistic parameters, adjustment rule/bounds, and cold-start status.
 
-model_config = ModelConfig(learning_rate=0.01, l2=0.0, decision_threshold=0.5)
-state = load_participant_checkpoint(
-    "checkpoints/P017.pkl",
-    expected_participant_id="P017",
-    expected_participant_sequence_index=16,
-    expected_model_config=model_config,
-)
-```
+Policy, completed-session, and training-report files use canonical JSON. Writing
+identical content to the same path is idempotent; different content at an existing
+path fails loudly. Legacy `.pkl` River checkpoints and old online-learning record
+schemas are rejected rather than migrated because they were produced under the
+superseded scientific design.
 
-Wrong participant, schema, feature signature, model configuration, sequence index,
-training counters, or River version fails loudly. There is no migration layer.
-Because pickle can execute code during loading, do not load checkpoints obtained
-from an untrusted source.
+## Configuration
 
-## Configuration: what is adjustable and what is fixed
+The complete default is `configs/experiment_learning.yaml`; partial overrides use
+the project-wide recursive merge and unknown-key rejection.
 
-The complete synthetic default is `configs/experiment_learning.yaml`. Important
-adjustable values are:
+Important options:
 
-| Config path | Default | Purpose |
+| Key | Default | Meaning |
 | --- | ---: | --- |
-| `timing.minimum_prediction_elapsed_s` | `0.25` | Earliest candidate-relative cutoff |
-| `timing.eeg_window_s` | `1.0` | Backward EEG context length |
-| `timing.feedback_timeout_s` | `1.5` | Feedback window duration |
-| `model.learning_rate` | `0.01` | River SGD learning rate |
-| `model.l2` | `0.0` | Logistic-regression L2 penalty |
-| `model.decision_threshold` | `0.5` | Binary scoring threshold |
-| `participant_sequence_index` | `0` | G-first/E-first counterbalance parity |
-| `seed` | `42` | Deterministic synthetic fixture RNG |
-| `episodes` | `2000` | Synthetic stress episode count |
-| `sessions` | `4` | Synthetic schedule/session count |
+| `sequence_id` | `g-first` | Row sequence in the approved CSV |
+| `schedule_path` | schedule CSV | Predetermined G/E schedule |
+| `timing.minimum_prediction_elapsed_s` | `0.25` | Earliest episode-relative EEG freeze |
+| `timing.eeg_window_s` | `1.0` | Closed backward EEG history |
+| `timing.feedback_timeout_s` | `1.5` | Half-open feedback duration |
+| `cold_start_policy.base_threshold_s` | `1.0` | Session-1 common G/E base |
+| `cold_start_policy.minimum_e_threshold_s` | `0.35` | Absolute E floor |
+| `trainer.minimum_examples` | `20` | Minimum paired examples |
+| `trainer.minimum_per_class` | `5` | Minimum examples for each label |
+| `trainer.l2` | `0.0` | Scalar logistic coefficient penalty |
+| `trainer.base_min_s/max_s/step_s` | `0.5/1.5/0.05` | G threshold grid |
+| `trainer.reduction_values` | `0.0..0.5` | E maximum-reduction grid |
+| `trainer.objective.*` | `2/1/0.25` | FP/FN/latency weights |
+| `trainer.optimizer.*` | `1000`, `1e-12` | Deterministic L-BFGS-B limits |
 
-The defaults are starting experimental parameters, not claims of physiological or
-hardware optimality. The paired missing-EEG behavior, common feedback truth table,
-single frozen prediction, active/shadow isolation, controlled-intention separation,
-and score-before-update order are scientific rules, not YAML switches.
-
-As with other project runners, a custom YAML is a partial strict override. Unknown
-keys fail instead of being ignored. For example:
+Example partial override:
 
 ```yaml
-episodes: 100
-participant_id: synthetic-smoke
-participant_sequence_index: 1
-model:
-  learning_rate: 0.005
-resume_check:
-  enabled: false
+participant_id: P017
+sequence_id: e-first
+trainer:
+  l2: 0.1
 ```
 
-Run it with:
-
-```bash
-python scripts/run_experiment_learning.py --config path/to/override.yaml
-```
-
-The default run needs no CV model or Guardian:
+Run the hardware-free workflow:
 
 ```bash
 python scripts/run_experiment_learning.py
+python scripts/run_experiment_learning.py --config path/to/override.yaml
 ```
 
-Each synthetic run writes `resolved_config.json`, `events.jsonl`,
-`participant_state.pkl`, and `summary.json`. The runner intentionally exercises
-both active conditions, all four feedback cases, usable/rejected/unavailable EEG,
-controlled trials, and a checkpoint reload. Synthetic classifier accuracy is not
-a scientific performance claim.
+It saves resolved configuration, schedule-bound policies, completed-session
+artifacts, training reports, scientific JSONL events, and a deterministic summary.
+The synthetic seed controls only generated data; the trainer itself is seedless.
 
-The only new runtime dependency is `river==0.22.0` (BSD-3-Clause). It is pinned
-because that release keeps the repository's existing Python `>=3.10` floor;
-Instance 4 imports River normally and does not copy external model code.
+## Required Instance 5 correction
 
-## Scientific records and events
+Merged Instance 5 still imports the removed `ParticipantState`, `ModelConfig`,
+pickle checkpoint, parity schedule, and online-learning controller calls. It must be
+updated before the integrated runner can use this corrected subsystem. Specifically:
 
-`experiment_prediction` contains participant/session/episode identity, active
-condition, cutoff, G/E probability or explicit paired unavailability, exact EEG
-request/quality, and the active control score.
+- replace checkpoint allocation/resume with schedule + frozen-policy attempt binding;
+- construct dwell parameters from the active condition's frozen policy;
+- replace `consider_prediction` with `evaluate_update`;
+- replace `on_dwell_trigger`/`on_episode_end`/`button_press` with the explicit
+  action/no-action/feedback operations documented above;
+- pass `action_gate_open` to Instance 2 and apply cancellation instructions;
+- persist `CompletedSession` only on successful closure and invoke the trainer once;
+- remove training-count assertions and analyze the new episode/session/report schemas.
 
-`experiment_episode_result` contains visible action/no-action, feedback timing and
-press/timeout state, common label, both frozen probabilities and thresholded
-correctness results, update status/reason, and optional instructed intention.
-
-Auxiliary events such as `experiment_feedback_ignored`,
-`experiment_episode_suppressed`, and `experiment_outcome_unscored` explain why an
-interaction did not enter the paired experiment. Instance 5 should preserve these
-events alongside the main scientific records rather than infer missing-data reasons
-from absent rows.
+Instances 1–3 require no changes. `river==0.22.0` has been removed; existing NumPy
+and SciPy dependencies cover the corrected implementation.

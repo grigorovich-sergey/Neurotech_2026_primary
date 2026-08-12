@@ -1,0 +1,17 @@
+sequence_id,session_number,condition
+g-first,1,G
+g-first,2,E
+g-first,3,G
+g-first,4,E
+g-first,5,G
+g-first,6,E
+g-first,7,G
+g-first,8,E
+e-first,1,E
+e-first,2,G
+e-first,3,E
+e-first,4,G
+e-first,5,E
+e-first,6,G
+e-first,7,E
+e-first,8,G

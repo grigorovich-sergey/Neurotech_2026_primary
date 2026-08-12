@@ -1,1 +1,1 @@
-"""Instance 4 experimental logic and participant-specific online learning."""
+"""Frozen-session G/E experimental policy and between-session learning."""

@@ -1,7 +1,7 @@
 output_root: runs
-checkpoint_filename: participant_state.pkl
 participant_id: synthetic-P001
-participant_sequence_index: 0
+sequence_id: g-first
+schedule_path: configs/experiment_condition_schedule.csv
 seed: 42
 episodes: 2000
 sessions: 4
@@ -10,14 +10,40 @@ timing:
   minimum_prediction_elapsed_s: 0.25
   eeg_window_s: 1.0
   feedback_timeout_s: 1.5
-  episode_spacing_s: 2.0
-  outcome_delay_s: 0.2
+  episode_spacing_s: 3.0
   button_delay_s: 0.2
+  trajectory_step_s: 0.05
 
-model:
-  learning_rate: 0.01
+cold_start_policy:
+  base_threshold_s: 1.0
+  minimum_e_threshold_s: 0.35
+  base_search_min_s: 0.5
+  base_search_max_s: 1.5
+  base_search_step_s: 0.05
+  maximum_allowed_reduction_fraction: 0.5
+
+trainer:
+  minimum_examples: 20
+  minimum_per_class: 5
   l2: 0.0
-  decision_threshold: 0.5
+  base_min_s: 0.5
+  base_max_s: 1.5
+  base_step_s: 0.05
+  reduction_values:
+    - 0.0
+    - 0.1
+    - 0.2
+    - 0.3
+    - 0.4
+    - 0.5
+  minimum_e_threshold_s: 0.35
+  objective:
+    false_positive_weight: 2.0
+    false_negative_weight: 1.0
+    true_positive_latency_weight: 0.25
+  optimizer:
+    max_iterations: 1000
+    ftol: 1.0e-12
 
 synthetic:
   eeg_quality_cycle:
@@ -37,7 +63,3 @@ synthetic:
     - no_action_no_press
     - no_action_press
   controlled_trial_every_n: 10
-
-resume_check:
-  enabled: true
-  after_session: 2
