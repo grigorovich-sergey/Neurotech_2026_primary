@@ -7,11 +7,19 @@ import numpy as np
 from eeg_pipeline.contracts import EEGSample
 from foundations.config import load_resolved_config
 from foundations.contracts import GazeSample, SceneFrame
+from foundations.timebase import MonotonicClock
 from gaze_interaction.contracts import BoundingBox, Detection, TrackedObject, TrackedScene
+from gaze_interaction.dwell import DwellState, DwellTrigger
+from gaze_interaction.episodes import CandidateEpisode, EpisodeEndReason
+from gaze_interaction.pipeline import InteractionUpdate
 from mindlink import FrameMetadata, GazeMetadata
 from practice_session.runner import (
+    _InteractionDecisionReporter,
+    _TerminalReporter,
+    _ThreadSafeEvents,
     PROJECT_ROOT,
     _overlay_gaze_indicator,
+    _wait_for_start_signal,
     run_practice_session,
 )
 
@@ -127,6 +135,7 @@ def test_practice_runs_live_gaze_path_without_experimental_artifacts(
         detector=FakeDetector(),
         tracker=FakeTracker(),
         mindlink_factory=mindlink_factory,
+        start_gate=lambda: True,
     )
 
     assert instances[0].log == ["connect", "calibrate", "start_capture", "close"]
@@ -136,6 +145,9 @@ def test_practice_runs_live_gaze_path_without_experimental_artifacts(
     assert summary["run_type"] == "practice"
     assert summary["experimental_session"] is False
     assert summary["stop_reason"] == "duration_reached"
+    assert summary["attempt_started_timestamp"] is not None
+    assert summary["attempt_duration_seconds"] is not None
+    assert summary["eeg_started"] is False
     assert summary["eeg_enabled"] is False
     assert summary["diagnostics"]["scene_received"] == 1
     assert summary["diagnostics"]["scene_processed"] == 1
@@ -163,7 +175,255 @@ def test_practice_runs_live_gaze_path_without_experimental_artifacts(
     assert not any("policy" in path.name or "training" in path.name for path in run.iterdir())
     terminal = capsys.readouterr().out
     assert "SELECTION triggered: cup (track 1)" in terminal
+    assert "CANDIDATE start: episode=1 cup (track 1)" in terminal
+    assert "TRIGGER: episode=1 cup (track 1)" in terminal
     assert "stopped: duration_reached | successful=True" in terminal
+
+
+def test_space_gate_precedes_attempt_clock_capture_and_display(
+    tmp_path: Path, monkeypatch
+) -> None:
+    instances: list[FakeMindLink] = []
+    clock_constructions: list[str] = []
+    ui_calls: list[str] = []
+    config = _config(tmp_path)
+    config["display"]["enabled"] = True
+
+    monkeypatch.setattr(
+        "practice_session.runner.cv2.namedWindow",
+        lambda *_: ui_calls.append("namedWindow"),
+    )
+    monkeypatch.setattr("practice_session.runner.cv2.imshow", lambda *_: None)
+    monkeypatch.setattr("practice_session.runner.cv2.waitKey", lambda *_: -1)
+    monkeypatch.setattr(
+        "practice_session.runner.cv2.getWindowProperty", lambda *_: 1.0
+    )
+    monkeypatch.setattr(
+        "practice_session.runner.cv2.destroyAllWindows",
+        lambda: ui_calls.append("destroyAllWindows"),
+    )
+
+    def mindlink_factory(**kwargs) -> FakeMindLink:
+        instance = FakeMindLink(**kwargs)
+        instances.append(instance)
+        return instance
+
+    def clock_factory() -> MonotonicClock:
+        clock_constructions.append("clock")
+        return MonotonicClock()
+
+    def start_gate() -> bool:
+        assert instances[0].log == ["connect", "calibrate"]
+        assert clock_constructions == []
+        assert ui_calls == []
+        return True
+
+    run = run_practice_session(
+        config,
+        detector=FakeDetector(),
+        tracker=FakeTracker(),
+        mindlink_factory=mindlink_factory,
+        clock_factory=clock_factory,
+        start_gate=start_gate,
+    )
+
+    assert clock_constructions == ["clock"]
+    assert ui_calls == ["namedWindow", "destroyAllWindows"]
+    assert instances[0].log == ["connect", "calibrate", "start_capture", "close"]
+    event_names = [event["name"] for event in _events(run)]
+    assert event_names.index("practice_mindlink_calibrated") < event_names.index(
+        "practice_run_started"
+    )
+    assert event_names.index("practice_run_started") < event_names.index(
+        "practice_capture_started"
+    )
+
+
+def test_prestart_abort_never_starts_clock_capture_display_or_eeg(
+    tmp_path: Path, capsys
+) -> None:
+    instances: list[FakeMindLink] = []
+    clock_constructions: list[str] = []
+    guardian_constructions: list[str] = []
+    config = _config(tmp_path, eeg_enabled=True)
+    config["recording"]["glasses_enabled"] = True
+
+    def mindlink_factory(**kwargs) -> FakeMindLink:
+        instance = FakeMindLink(**kwargs)
+        instances.append(instance)
+        return instance
+
+    def clock_factory() -> MonotonicClock:
+        clock_constructions.append("clock")
+        return MonotonicClock()
+
+    def guardian_factory(**_: object) -> object:
+        guardian_constructions.append("guardian")
+        return object()
+
+    run = run_practice_session(
+        config,
+        detector=FakeDetector(),
+        tracker=FakeTracker(),
+        mindlink_factory=mindlink_factory,
+        guardian_factory=guardian_factory,
+        clock_factory=clock_factory,
+        start_gate=lambda: False,
+    )
+
+    assert instances[0].log == ["connect", "calibrate", "close"]
+    assert clock_constructions == []
+    assert guardian_constructions == []
+    assert not (run / "practice_glasses.h5").exists()
+    assert not (run / "practice_eeg.h5").exists()
+    assert not (run / "mindlink_frame_metadata.jsonl").exists()
+    assert not (run / "mindlink_gaze_metadata.jsonl").exists()
+    summary = json.loads((run / "practice_summary.json").read_text(encoding="utf-8"))
+    assert summary["stop_reason"] == "operator_abort_before_start"
+    assert summary["attempt_started_timestamp"] is None
+    assert summary["capture_started_timestamp"] is None
+    assert summary["attempt_duration_seconds"] is None
+    assert summary["capture_duration_seconds"] is None
+    assert summary["eeg_started"] is False
+    event_names = [event["name"] for event in _events(run)]
+    assert "practice_setup_aborted" in event_names
+    assert "practice_run_started" not in event_names
+    assert "practice_capture_started" not in event_names
+    terminal = capsys.readouterr().out
+    assert "[practice setup] calibration complete; acquisition is OFF" in terminal
+    assert "[practice setup] aborted before acquisition start" in terminal
+
+
+def test_start_signal_ignores_other_keys_and_accepts_only_start_or_abort() -> None:
+    keys = iter(("x", "\n", " "))
+    assert _wait_for_start_signal(lambda: next(keys)) is True
+    assert _wait_for_start_signal(lambda: "q") is False
+    assert _wait_for_start_signal(lambda: "\x1b") is False
+
+
+def test_decision_reporter_describes_instance_2_transitions(
+    tmp_path: Path, capsys
+) -> None:
+    event_path = tmp_path / "decisions.jsonl"
+    reporter = _InteractionDecisionReporter(
+        _TerminalReporter(), _ThreadSafeEvents(event_path)
+    )
+    box = BoundingBox(0.2, 0.2, 0.8, 0.8)
+    cup = TrackedObject(7, box, "cup", 0.95, 1.0)
+    laptop = TrackedObject(3, box, "laptop", 0.94, 2.0)
+    episode_1 = CandidateEpisode(1, 7, "cup", 1.0, 1.0, None, None)
+
+    reporter.report(
+        InteractionUpdate(
+            GazeSample(1.0, 0.5, 0.5, True, None),
+            1.0,
+            cup,
+            episode_1,
+            None,
+            DwellState(1, 0.0, 1.0, False),
+            None,
+        )
+    )
+    reporter.report(
+        InteractionUpdate(
+            GazeSample(1.3, 0.5, 0.5, True, None),
+            1.0,
+            cup,
+            CandidateEpisode(1, 7, "cup", 1.0, 1.3, None, None),
+            None,
+            DwellState(1, 0.3, 1.0, False),
+            None,
+        )
+    )
+    reporter.report(
+        InteractionUpdate(
+            GazeSample(1.4, None, None, False, None),
+            None,
+            None,
+            CandidateEpisode(1, 7, "cup", 1.0, 1.3, None, None),
+            None,
+            DwellState(1, 0.3, 1.0, False),
+            None,
+        )
+    )
+    reporter.report(
+        InteractionUpdate(
+            GazeSample(1.5, 0.5, 0.5, True, None),
+            1.0,
+            cup,
+            CandidateEpisode(1, 7, "cup", 1.0, 1.5, None, None),
+            None,
+            DwellState(1, 0.4, 1.0, False),
+            None,
+        )
+    )
+    episode_2 = CandidateEpisode(2, 3, "laptop", 2.0, 2.0, None, None)
+    reporter.report(
+        InteractionUpdate(
+            GazeSample(2.0, 0.5, 0.5, True, None),
+            2.0,
+            laptop,
+            episode_2,
+            CandidateEpisode(
+                1,
+                7,
+                "cup",
+                1.0,
+                1.5,
+                2.0,
+                EpisodeEndReason.CANDIDATE_CHANGE,
+            ),
+            DwellState(2, 0.0, 1.0, False),
+            None,
+        )
+    )
+    reporter.report(
+        InteractionUpdate(
+            GazeSample(3.0, 0.5, 0.5, True, None),
+            2.0,
+            laptop,
+            CandidateEpisode(2, 3, "laptop", 2.0, 3.0, None, None),
+            None,
+            DwellState(2, 1.0, 1.0, True),
+            DwellTrigger(2, 3, 3.0, 1.0),
+        )
+    )
+    reporter.finish(
+        CandidateEpisode(
+            2,
+            3,
+            "laptop",
+            2.0,
+            3.0,
+            3.1,
+            EpisodeEndReason.SOURCE_END,
+        )
+    )
+
+    terminal = capsys.readouterr().out
+    assert "CANDIDATE start: episode=1 cup (track 7)" in terminal
+    assert "DWELL 25%: episode=1 cup (track 7)" in terminal
+    assert "CANDIDATE pause: episode=1 cup (track 7) reason=invalid_gaze" in terminal
+    assert "CANDIDATE resume: episode=1 cup (track 7)" in terminal
+    assert "CANDIDATE switch: episode=1 cup (track 7) -> episode=2 laptop (track 3)" in terminal
+    assert "TRIGGER: episode=2 laptop (track 3) dwell=1.000/1.000s" in terminal
+    assert "EPISODE end: episode=2 laptop (track 3) reason=source_end" in terminal
+    event_names = [
+        json.loads(line)["name"]
+        for line in event_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert event_names == [
+        "practice_candidate_started",
+        "practice_dwell_progress",
+        "practice_candidate_paused",
+        "practice_candidate_resumed",
+        "practice_candidate_switched",
+        "practice_dwell_progress",
+        "practice_dwell_progress",
+        "practice_dwell_progress",
+        "practice_dwell_trigger",
+        "practice_episode_ended",
+    ]
 
 
 def test_practice_gaze_indicator_is_visible_and_does_not_mutate_input() -> None:
@@ -215,11 +475,13 @@ def test_optional_eeg_uses_shared_clock_and_stops_with_practice(
         tracker=FakeTracker(),
         mindlink_factory=mindlink_factory,
         guardian_factory=FakeGuardian,
+        start_gate=lambda: True,
     )
 
     assert mindlink_clocks[0].__self__ is guardian_clocks[0].__self__
     summary = json.loads((run / "practice_summary.json").read_text(encoding="utf-8"))
     assert summary["successful"] is True
+    assert summary["eeg_started"] is True
     assert summary["eeg"]["sample_count"] == 20
     assert summary["eeg"]["impedance_ohms"] == 12_000.0
     assert (run / "practice_eeg.h5").is_file()

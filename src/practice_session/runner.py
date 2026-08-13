@@ -33,7 +33,7 @@ from foundations.timebase import MonotonicClock
 from gaze_interaction.association import GazeAssociator
 from gaze_interaction.detector import YOLOEDetector
 from gaze_interaction.dwell import DwellController
-from gaze_interaction.episodes import EpisodeTracker
+from gaze_interaction.episodes import CandidateEpisode, EpisodeEndReason, EpisodeTracker
 from gaze_interaction.pipeline import GazeInteractionPipeline, InteractionUpdate, SceneUpdate
 from gaze_interaction.tracker import ByteTrackAdapter
 from gaze_interaction.visualization import render_diagnostic
@@ -211,14 +211,86 @@ class _ThreadSafeEvents:
 
 
 class _TerminalReporter:
-    """Serialize concise operator-facing notices from the main and worker threads."""
+    """Serialize setup and attempt notices from the main and worker threads."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
 
+    def setup(self, message: str) -> None:
+        with self._lock:
+            print(f"[practice setup] {message}", flush=True)
+
     def report(self, timestamp: float, message: str) -> None:
         with self._lock:
             print(f"[practice {float(timestamp):8.3f}s] {message}", flush=True)
+
+
+class _DeferredAttemptClock:
+    """Expose one shared clock callable whose origin is the operator start signal."""
+
+    def __init__(self, factory: Callable[[], Any]) -> None:
+        if not callable(factory):
+            raise TypeError("clock_factory must be callable")
+        self._factory = factory
+        self._clock: Any | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def started(self) -> bool:
+        with self._lock:
+            return self._clock is not None
+
+    def start(self) -> float:
+        with self._lock:
+            if self._clock is not None:
+                raise RuntimeError("attempt clock has already started")
+            clock = self._factory()
+            if not callable(getattr(clock, "now", None)):
+                raise TypeError("clock_factory must return an object with now()")
+            self._clock = clock
+            return float(clock.now())
+
+    def now(self) -> float:
+        with self._lock:
+            clock = self._clock
+        return 0.0 if clock is None else float(clock.now())
+
+
+def _read_single_key() -> str:
+    """Read one console key without requiring Enter on Windows or POSIX."""
+
+    if os.name == "nt":
+        import msvcrt
+
+        return msvcrt.getwch()
+    if not sys.stdin.isatty():
+        raise RuntimeError("the practice SPACE gate requires an interactive terminal")
+
+    import termios
+    import tty
+
+    descriptor = sys.stdin.fileno()
+    previous = termios.tcgetattr(descriptor)
+    try:
+        tty.setcbreak(descriptor)
+        return sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
+
+
+def _wait_for_start_signal(
+    read_key: Callable[[], str] = _read_single_key,
+) -> bool:
+    """Return only for SPACE (start) or Q/Esc/Ctrl-C (abort)."""
+
+    if not callable(read_key):
+        raise TypeError("read_key must be callable")
+    while True:
+        key = read_key()
+        if key == " ":
+            return True
+        if key in {"q", "Q", "\x1b", "\x03"}:
+            return False
 
 
 class _JsonlWriter:
@@ -259,6 +331,216 @@ class _RunState:
             elif self.reason is None:
                 self.reason = reason
         self.stop.set()
+
+
+def _episode_subject(episode: CandidateEpisode) -> str:
+    label = episode.label or f"object #{episode.track_id}"
+    return f"episode={episode.episode_id} {label} (track {episode.track_id})"
+
+
+class _InteractionDecisionReporter:
+    """Report transitions already decided by the Instance 2 pipeline."""
+
+    _PROGRESS_MARKS = (0.25, 0.50, 0.75)
+
+    def __init__(self, terminal: _TerminalReporter, events: _ThreadSafeEvents) -> None:
+        self._terminal = terminal
+        self._events = events
+        self._active_episode_id: int | None = None
+        self._paused_episode_id: int | None = None
+        self._reported_progress: set[float] = set()
+
+    def _emit(
+        self,
+        timestamp: float,
+        name: str,
+        message: str,
+        payload: dict[str, Any],
+    ) -> None:
+        self._events.log(timestamp, name, payload)
+        self._terminal.report(timestamp, message)
+
+    def _report_episode_end(self, episode: CandidateEpisode) -> None:
+        reason = episode.end_reason.value if episode.end_reason is not None else "unknown"
+        timestamp = float(
+            episode.last_match_timestamp
+            if episode.end_timestamp is None
+            else episode.end_timestamp
+        )
+        self._emit(
+            timestamp,
+            "practice_episode_ended",
+            f"EPISODE end: {_episode_subject(episode)} reason={reason}",
+            {
+                "episode_id": episode.episode_id,
+                "track_id": episode.track_id,
+                "label": episode.label,
+                "reason": reason,
+            },
+        )
+
+    @staticmethod
+    def _pause_reason(update: InteractionUpdate) -> str:
+        if not update.gaze.valid:
+            return "invalid_gaze"
+        if update.scene_timestamp is None:
+            return "no_eligible_scene"
+        return "no_object_at_gaze"
+
+    def report(self, update: InteractionUpdate) -> None:
+        timestamp = float(update.gaze.timestamp)
+        active = update.active_episode
+        ended = update.ended_episode
+        switched = (
+            ended is not None
+            and ended.end_reason is EpisodeEndReason.CANDIDATE_CHANGE
+            and active is not None
+        )
+
+        if switched:
+            assert ended is not None and active is not None
+            self._emit(
+                timestamp,
+                "practice_candidate_switched",
+                (
+                    f"CANDIDATE switch: {_episode_subject(ended)} -> "
+                    f"{_episode_subject(active)}"
+                ),
+                {
+                    "from_episode_id": ended.episode_id,
+                    "from_track_id": ended.track_id,
+                    "from_label": ended.label,
+                    "to_episode_id": active.episode_id,
+                    "to_track_id": active.track_id,
+                    "to_label": active.label,
+                },
+            )
+        elif ended is not None:
+            self._report_episode_end(ended)
+
+        active_id = active.episode_id if active is not None else None
+        if active_id != self._active_episode_id:
+            self._paused_episode_id = None
+            self._reported_progress.clear()
+            if active is not None and not switched:
+                self._emit(
+                    timestamp,
+                    "practice_candidate_started",
+                    (
+                        f"CANDIDATE start: {_episode_subject(active)} "
+                        f"dwell={update.dwell_state.accumulated_seconds:.3f}/"
+                        f"{update.dwell_state.required_seconds:.3f}s"
+                    ),
+                    {
+                        "episode_id": active.episode_id,
+                        "track_id": active.track_id,
+                        "label": active.label,
+                        "required_seconds": update.dwell_state.required_seconds,
+                    },
+                )
+
+        matched = (
+            active is not None
+            and update.candidate is not None
+            and update.candidate.track_id == active.track_id
+        )
+        if active is not None and not matched:
+            if self._paused_episode_id != active.episode_id:
+                reason = self._pause_reason(update)
+                self._emit(
+                    timestamp,
+                    "practice_candidate_paused",
+                    f"CANDIDATE pause: {_episode_subject(active)} reason={reason}",
+                    {
+                        "episode_id": active.episode_id,
+                        "track_id": active.track_id,
+                        "label": active.label,
+                        "reason": reason,
+                    },
+                )
+                self._paused_episode_id = active.episode_id
+        elif active is not None and self._paused_episode_id == active.episode_id:
+            self._emit(
+                timestamp,
+                "practice_candidate_resumed",
+                (
+                    f"CANDIDATE resume: {_episode_subject(active)} "
+                    f"dwell={update.dwell_state.accumulated_seconds:.3f}/"
+                    f"{update.dwell_state.required_seconds:.3f}s"
+                ),
+                {
+                    "episode_id": active.episode_id,
+                    "track_id": active.track_id,
+                    "label": active.label,
+                    "accumulated_seconds": update.dwell_state.accumulated_seconds,
+                    "required_seconds": update.dwell_state.required_seconds,
+                },
+            )
+            self._paused_episode_id = None
+
+        if active is not None and update.dwell_state.required_seconds > 0.0:
+            fraction = (
+                update.dwell_state.accumulated_seconds
+                / update.dwell_state.required_seconds
+            )
+            for mark in self._PROGRESS_MARKS:
+                if mark in self._reported_progress or fraction < mark:
+                    continue
+                self._reported_progress.add(mark)
+                percent = int(round(mark * 100))
+                self._emit(
+                    timestamp,
+                    "practice_dwell_progress",
+                    (
+                        f"DWELL {percent}%: {_episode_subject(active)} "
+                        f"{update.dwell_state.accumulated_seconds:.3f}/"
+                        f"{update.dwell_state.required_seconds:.3f}s"
+                    ),
+                    {
+                        "episode_id": active.episode_id,
+                        "track_id": active.track_id,
+                        "label": active.label,
+                        "percent": percent,
+                        "accumulated_seconds": update.dwell_state.accumulated_seconds,
+                        "required_seconds": update.dwell_state.required_seconds,
+                    },
+                )
+
+        trigger = update.dwell_trigger
+        if trigger is not None:
+            label = active.label if active is not None else None
+            subject = (
+                _episode_subject(active)
+                if active is not None
+                else f"episode={trigger.episode_id} object #{trigger.track_id} "
+                f"(track {trigger.track_id})"
+            )
+            self._emit(
+                trigger.timestamp,
+                "practice_dwell_trigger",
+                (
+                    f"TRIGGER: {subject} "
+                    f"dwell={update.dwell_state.accumulated_seconds:.3f}/"
+                    f"{trigger.required_seconds:.3f}s"
+                ),
+                {
+                    "episode_id": trigger.episode_id,
+                    "track_id": trigger.track_id,
+                    "label": label,
+                    "accumulated_seconds": update.dwell_state.accumulated_seconds,
+                    "required_seconds": trigger.required_seconds,
+                },
+            )
+
+        self._active_episode_id = active_id
+
+    def finish(self, episode: CandidateEpisode | None) -> None:
+        if episode is None:
+            return
+        self._report_episode_end(episode)
+        self._active_episode_id = None
+        self._paused_episode_id = None
+        self._reported_progress.clear()
 
 
 class _Diagnostics:
@@ -544,10 +826,13 @@ def run_practice_session(
     mindlink_factory: Callable[..., Any] = MindLinkAdapter,
     guardian_factory: Callable[..., Any] = GuardianAdapter,
     clock_factory: Callable[[], MonotonicClock] = MonotonicClock,
+    start_gate: Callable[[], bool] = _wait_for_start_signal,
 ) -> Path:
     """Run a live diagnostic; never create experimental or training artifacts."""
 
     _validate_config(config)
+    if not callable(start_gate):
+        raise TypeError("start_gate must be callable")
     resolved = deepcopy(config)
     mindlink_config, gaze_config, eeg_config = _load_subsystem_configs(resolved)
     gaze_pipeline = _build_gaze_pipeline(gaze_config, detector=detector, tracker=tracker)
@@ -560,6 +845,7 @@ def run_practice_session(
 
     events = _ThreadSafeEvents(run_directory / "events.jsonl")
     terminal = _TerminalReporter()
+    decisions = _InteractionDecisionReporter(terminal, events)
     state = _RunState()
     diagnostics = _Diagnostics()
     processing = resolved["processing"]
@@ -571,45 +857,34 @@ def run_practice_session(
     gaze_queue: queue.Queue[GazeSample] = queue.Queue(
         maxsize=processing["gaze_queue_size"]
     )
-    clock = clock_factory()
-    event_start = clock.now()
+    clock = _DeferredAttemptClock(clock_factory)
     events.log(
-        event_start,
-        "practice_run_started",
-        {"eeg_enabled": resolved["eeg"]["enabled"]},
+        0.0,
+        "practice_setup_started",
+        {"phase": "setup", "eeg_enabled": resolved["eeg"]["enabled"]},
     )
 
-    glasses_recorder = (
-        HDF5Recorder(run_directory / "practice_glasses.h5")
-        if recording["glasses_enabled"]
-        else None
-    )
+    glasses_recorder: HDF5Recorder | None = None
     glasses_lock = threading.Lock()
     metadata_enabled = resolved["diagnostics"]["write_mindlink_metadata"]
-    frame_metadata_writer = (
-        _JsonlWriter(run_directory / "mindlink_frame_metadata.jsonl")
-        if metadata_enabled
-        else None
-    )
-    gaze_metadata_writer = (
-        _JsonlWriter(run_directory / "mindlink_gaze_metadata.jsonl")
-        if metadata_enabled
-        else None
-    )
+    frame_metadata_writer: _JsonlWriter | None = None
+    gaze_metadata_writer: _JsonlWriter | None = None
     latest_adapter_drop = [0]
     intentional_close = threading.Event()
 
     def fail(reason: str, exc: BaseException) -> None:
         timestamp = clock.now()
+        phase = "attempt" if clock.started else "setup"
         events.log(
             timestamp,
             "practice_error",
-            {"source": reason, "error": type(exc).__name__},
+            {"phase": phase, "source": reason, "error": type(exc).__name__},
         )
-        terminal.report(
-            timestamp,
-            f"ERROR {reason}: {type(exc).__name__}: {exc}",
-        )
+        message = f"ERROR {reason}: {type(exc).__name__}: {exc}"
+        if clock.started:
+            terminal.report(timestamp, message)
+        else:
+            terminal.setup(message)
         state.request_stop(reason, exc)
 
     def record_glasses(sample: SceneFrame | GazeSample) -> None:
@@ -701,16 +976,9 @@ def run_practice_session(
     eeg_monitor: _EEGMonitor | None = None
     eeg_recorder: EEGHDF5Recorder | None = None
     guardian_thread: threading.Thread | None = None
-    if resolved["eeg"]["enabled"]:
-        eeg_pipeline = _build_eeg_pipeline(eeg_config)
-        if recording["eeg_enabled"] and eeg_config["recording"]["enabled"]:
-            eeg_recorder = EEGHDF5Recorder(
-                run_directory / "practice_eeg.h5",
-                sample_rate_hz=eeg_config["signal"]["sample_rate_hz"],
-            )
-        eeg_monitor = _EEGMonitor(eeg_pipeline, eeg_recorder)
 
     adapter: Any | None = None
+    attempt_started_at: float | None = None
     capture_started_at: float | None = None
     calibration_result: Any = None
     latest_frame: SceneFrame | None = None
@@ -722,6 +990,7 @@ def run_practice_session(
     selection_until = 0.0
     last_eeg_refresh = 0.0
     warned_no_frame = False
+    display_started = False
 
     try:
         capture = mindlink_config["capture"]
@@ -731,91 +1000,155 @@ def run_practice_session(
             on_disconnect=on_disconnect,
         )
         connection = mindlink_config["connection"]
-        terminal.report(clock.now(), "connecting to MindLink")
+        terminal.setup("connecting to MindLink")
         adapter.connect(
             connect_timeout_seconds=connection["connect_timeout_seconds"],
             tracker_ready_timeout_seconds=connection["tracker_ready_timeout_seconds"],
         )
-        connected_at = clock.now()
-        events.log(connected_at, "practice_mindlink_connected", {})
-        terminal.report(connected_at, "MindLink connected")
+        events.log(
+            0.0,
+            "practice_mindlink_connected",
+            {"phase": "setup", "acquisition_active": False},
+        )
+        terminal.setup("MindLink connected")
         calibration = mindlink_config["calibration"]
-        terminal.report(clock.now(), "starting MindLink calibration")
+        terminal.setup("starting MindLink calibration")
         calibration_result = adapter.calibrate(
             marker_size_mm=calibration["marker_size_mm"],
             returning_user=calibration["returning_user"],
             timeout_seconds=calibration["timeout_seconds"],
         )
-        calibrated_at = clock.now()
         events.log(
-            calibrated_at,
+            0.0,
             "practice_mindlink_calibrated",
-            {"result": repr(calibration_result)},
+            {
+                "phase": "setup",
+                "acquisition_active": False,
+                "result": repr(calibration_result),
+            },
         )
-        terminal.report(calibrated_at, "MindLink calibration complete")
+        terminal.setup(
+            "calibration complete; acquisition is OFF "
+            "(video receiver, gaze, EEG, timer, and display are not started)"
+        )
+        terminal.setup("press SPACE to start; Q, Esc, or Ctrl-C to abort")
 
-        if eeg_monitor is not None:
-            guardian = eeg_config["source"]["guardian"]
-            token_name = guardian["api_token_env"]
-            api_token = os.environ.get(token_name)
-            if not api_token:
-                raise RuntimeError(f"EEG practice requires environment variable {token_name}")
-            guardian_adapter = guardian_factory(
-                clock=clock.now,
-                address=guardian["address"],
-                api_token=api_token,
-                debug=guardian["debug"],
+        should_start = start_gate()
+        if not isinstance(should_start, bool):
+            raise TypeError("start_gate must return a bool")
+        if not should_start:
+            state.request_stop("operator_abort_before_start")
+            events.log(
+                0.0,
+                "practice_setup_aborted",
+                {"phase": "setup", "reason": "operator_abort_before_start"},
             )
+            terminal.setup("aborted before acquisition start")
+        else:
+            attempt_started_at = clock.start()
+            events.log(
+                attempt_started_at,
+                "practice_run_started",
+                {"phase": "attempt", "eeg_enabled": resolved["eeg"]["enabled"]},
+            )
+            terminal.report(attempt_started_at, "attempt started")
 
-            def on_eeg_sample(sample: EEGSample) -> None:
-                assert eeg_monitor is not None
-                diagnostics.eeg(sample.timestamp)
-                eeg_monitor.ingest(sample)
+            if recording["glasses_enabled"]:
+                glasses_recorder = HDF5Recorder(
+                    run_directory / "practice_glasses.h5"
+                )
+            if metadata_enabled:
+                frame_metadata_writer = _JsonlWriter(
+                    run_directory / "mindlink_frame_metadata.jsonl"
+                )
+                gaze_metadata_writer = _JsonlWriter(
+                    run_directory / "mindlink_gaze_metadata.jsonl"
+                )
 
-            def guardian_worker() -> None:
-                assert eeg_monitor is not None
-                try:
-                    impedance = guardian["impedance"]
-                    result = guardian_adapter.run(
-                        recording_seconds=guardian["recording_seconds"],
-                        on_sample=on_eeg_sample,
-                        impedance_preflight_seconds=(
-                            impedance["duration_seconds"] if impedance["enabled"] else None
-                        ),
-                        max_impedance_ohms=impedance["max_ohms"],
-                        mains_frequency_hz=impedance["mains_frequency_hz"],
-                        stop_requested=state.stop.is_set,
+            if resolved["eeg"]["enabled"]:
+                eeg_pipeline = _build_eeg_pipeline(eeg_config)
+                if recording["eeg_enabled"] and eeg_config["recording"]["enabled"]:
+                    eeg_recorder = EEGHDF5Recorder(
+                        run_directory / "practice_eeg.h5",
+                        sample_rate_hz=eeg_config["signal"]["sample_rate_hz"],
                     )
-                    eeg_monitor.stopped(result)
-                except BaseException as exc:
-                    fail("guardian_error", exc)
-                else:
-                    if not state.stop.is_set():
-                        state.request_stop("guardian_completed")
+                eeg_monitor = _EEGMonitor(eeg_pipeline, eeg_recorder)
+                guardian = eeg_config["source"]["guardian"]
+                token_name = guardian["api_token_env"]
+                api_token = os.environ.get(token_name)
+                if not api_token:
+                    raise RuntimeError(
+                        f"EEG practice requires environment variable {token_name}"
+                    )
+                guardian_adapter = guardian_factory(
+                    clock=clock.now,
+                    address=guardian["address"],
+                    api_token=api_token,
+                    debug=guardian["debug"],
+                )
 
-            guardian_thread = threading.Thread(
-                target=guardian_worker,
-                name="practice_guardian",
-                daemon=True,
+                def on_eeg_sample(sample: EEGSample) -> None:
+                    assert eeg_monitor is not None
+                    diagnostics.eeg(sample.timestamp)
+                    eeg_monitor.ingest(sample)
+
+                def guardian_worker() -> None:
+                    assert eeg_monitor is not None
+                    try:
+                        impedance = guardian["impedance"]
+                        result = guardian_adapter.run(
+                            recording_seconds=guardian["recording_seconds"],
+                            on_sample=on_eeg_sample,
+                            impedance_preflight_seconds=(
+                                impedance["duration_seconds"]
+                                if impedance["enabled"]
+                                else None
+                            ),
+                            max_impedance_ohms=impedance["max_ohms"],
+                            mains_frequency_hz=impedance["mains_frequency_hz"],
+                            stop_requested=state.stop.is_set,
+                        )
+                        eeg_monitor.stopped(result)
+                    except BaseException as exc:
+                        fail("guardian_error", exc)
+                    else:
+                        if not state.stop.is_set():
+                            state.request_stop("guardian_completed")
+
+                guardian_thread = threading.Thread(
+                    target=guardian_worker,
+                    name="practice_guardian",
+                    daemon=True,
+                )
+                terminal.report(clock.now(), "starting Guardian EEG monitor")
+                guardian_thread.start()
+
+            if display["enabled"]:
+                cv2.namedWindow(display["window_name"], cv2.WINDOW_NORMAL)
+                display_started = True
+            capture_start_requested_at = clock.now()
+            adapter.start_capture(
+                on_scene_frame=on_scene,
+                on_gaze_sample=on_gaze,
+                on_frame_metadata=on_frame_metadata,
+                on_gaze_metadata=on_gaze_metadata,
             )
-            terminal.report(clock.now(), "starting Guardian EEG monitor")
-            guardian_thread.start()
-
-        if display["enabled"]:
-            cv2.namedWindow(display["window_name"], cv2.WINDOW_NORMAL)
-        capture_started_at = clock.now()
-        adapter.start_capture(
-            on_scene_frame=on_scene,
-            on_gaze_sample=on_gaze,
-            on_frame_metadata=on_frame_metadata,
-            on_gaze_metadata=on_gaze_metadata,
-        )
-        events.log(capture_started_at, "practice_capture_started", {})
-        terminal.report(capture_started_at, "capture started; press Q or Esc to stop")
+            capture_started_at = capture_start_requested_at
+            events.log(
+                capture_started_at,
+                "practice_capture_started",
+                {"phase": "attempt"},
+            )
+            terminal.report(
+                capture_started_at,
+                "fresh MindLink capture started; press Q or Esc to stop",
+            )
 
         while not state.stop.is_set():
             now = clock.now()
-            if now - capture_started_at >= resolved["maximum_duration_seconds"]:
+            assert attempt_started_at is not None
+            assert capture_started_at is not None
+            if now - attempt_started_at >= resolved["maximum_duration_seconds"]:
                 state.request_stop("duration_reached")
                 break
             processed = False
@@ -835,6 +1168,7 @@ def run_practice_session(
                 except queue.Empty:
                     break
                 latest_interaction = gaze_pipeline.process_gaze(gaze, intent_score=None)
+                decisions.report(latest_interaction)
                 latest_gaze = gaze
                 last_gaze_timestamp = float(gaze.timestamp)
                 processed = True
@@ -966,9 +1300,9 @@ def run_practice_session(
                     "guardian_stop_timeout",
                     RuntimeError("Guardian did not stop within 15 seconds"),
                 )
-        if last_gaze_timestamp > 0.0:
+        if latest_interaction is not None:
             try:
-                gaze_pipeline.finish(last_gaze_timestamp)
+                decisions.finish(gaze_pipeline.finish(last_gaze_timestamp))
             except ValueError:
                 pass
         if eeg_recorder is not None:
@@ -979,7 +1313,7 @@ def run_practice_session(
             frame_metadata_writer.close()
         if gaze_metadata_writer is not None:
             gaze_metadata_writer.close()
-        if display["enabled"]:
+        if display_started:
             cv2.destroyAllWindows()
 
     if adapter is not None:
@@ -991,6 +1325,11 @@ def run_practice_session(
         )
     diagnostic_snapshot = diagnostics.snapshot()
     completed_at = clock.now()
+    attempt_duration = (
+        None
+        if attempt_started_at is None
+        else max(0.0, completed_at - attempt_started_at)
+    )
     capture_duration = (
         None
         if capture_started_at is None
@@ -1022,11 +1361,14 @@ def run_practice_session(
         "experimental_session": False,
         "stop_reason": state.reason or "completed",
         "successful": state.failure is None,
-        "started_timestamp": event_start,
+        "started_timestamp": attempt_started_at,
+        "attempt_started_timestamp": attempt_started_at,
         "capture_started_timestamp": capture_started_at,
         "completed_timestamp": completed_at,
+        "attempt_duration_seconds": attempt_duration,
         "capture_duration_seconds": capture_duration,
         "eeg_enabled": resolved["eeg"]["enabled"],
+        "eeg_started": eeg_monitor is not None,
         "calibration_result": repr(calibration_result),
         "diagnostics": diagnostic_snapshot,
         "stream_rates_hz": stream_rates_hz,
@@ -1044,17 +1386,19 @@ def run_practice_session(
         completed_at,
         "practice_run_stopped",
         {
+            "phase": "attempt" if clock.started else "setup",
             "reason": summary["stop_reason"],
             "successful": summary["successful"],
         },
     )
-    terminal.report(
-        completed_at,
-        (
-            f"stopped: {summary['stop_reason']} | "
-            f"successful={summary['successful']} | artifacts={run_directory}"
-        ),
+    final_message = (
+        f"stopped: {summary['stop_reason']} | "
+        f"successful={summary['successful']} | artifacts={run_directory}"
     )
+    if clock.started:
+        terminal.report(completed_at, final_message)
+    else:
+        terminal.setup(final_message)
 
     if state.failure is not None:
         raise RuntimeError(
