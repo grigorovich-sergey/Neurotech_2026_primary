@@ -1,6 +1,9 @@
 # Live MindLink practice override for the authoritative gaze-interaction defaults.
 # Provisional camera-rate value: pilot-tune against the effective processed-scene
 # rate after detector latency and queue drops are measured on the target computer.
+detector:
+  device: "cuda:0"
+
 tracker:
   frame_rate: 30
 
