@@ -21,7 +21,8 @@ import cv2
 
 from eeg_pipeline.buffer import EEGBuffer
 from eeg_pipeline.contracts import EEGSample
-from eeg_pipeline.guardian import GuardianAdapter
+from eeg_pipeline.credentials import load_guardian_api_token
+from eeg_pipeline.guardian import GuardianAdapter, GuardianPreflight
 from eeg_pipeline.pipeline import EEGPipeline
 from eeg_pipeline.processing import EEGFeatureExtractor, EEGPreprocessor, EEGQualityGate
 from eeg_pipeline.recording import EEGHDF5Recorder
@@ -623,17 +624,46 @@ class _Diagnostics:
 
 
 class _EEGMonitor:
-    def __init__(self, pipeline: EEGPipeline, recorder: EEGHDF5Recorder | None) -> None:
+    def __init__(
+        self,
+        pipeline: EEGPipeline,
+        recorder: EEGHDF5Recorder | None,
+        *,
+        sample_rate_hz: float,
+    ) -> None:
         self.pipeline = pipeline
         self.recorder = recorder
+        self.expected_interval_seconds = 1.0 / sample_rate_hz
         self.lock = threading.Lock()
         self.sample_count = 0
         self.first_timestamp: float | None = None
         self.last_timestamp: float | None = None
+        self.battery_percent: float | None = None
         self.impedance_ohms: float | None = None
-        self.status = "starting"
+        self.recording_id: str | None = None
+        self.gap_count = 0
+        self.largest_gap_seconds = 0.0
+        self.receipt_lag_count = 0
+        self.receipt_lag_sum_seconds = 0.0
+        self.receipt_lag_max_seconds: float | None = None
+        self.queue_overflowed = False
+        self.status = "created"
         self.quality_state = "not_available"
         self.quality_reasons: tuple[str, ...] = ()
+
+    def prepared(self, preflight: GuardianPreflight) -> None:
+        with self.lock:
+            self.battery_percent = preflight.battery_percent
+            self.impedance_ohms = preflight.impedance_ohms
+            self.status = "prepared"
+
+    def set_recorder(self, recorder: EEGHDF5Recorder | None) -> None:
+        with self.lock:
+            self.recorder = recorder
+
+    def started(self) -> None:
+        with self.lock:
+            self.status = "recording"
 
     def ingest(self, sample: EEGSample) -> None:
         with self.lock:
@@ -643,7 +673,22 @@ class _EEGMonitor:
             self.sample_count += 1
             if self.first_timestamp is None:
                 self.first_timestamp = sample.timestamp
+            if self.last_timestamp is not None:
+                gap = sample.timestamp - self.last_timestamp
+                if gap > 1.5 * self.expected_interval_seconds:
+                    self.gap_count += 1
+                    self.largest_gap_seconds = max(self.largest_gap_seconds, gap)
             self.last_timestamp = sample.timestamp
+            if sample.host_receipt_timestamp is not None:
+                lag = sample.host_receipt_timestamp - sample.timestamp
+                if math.isfinite(lag):
+                    self.receipt_lag_count += 1
+                    self.receipt_lag_sum_seconds += lag
+                    self.receipt_lag_max_seconds = (
+                        lag
+                        if self.receipt_lag_max_seconds is None
+                        else max(self.receipt_lag_max_seconds, lag)
+                    )
             self.status = "streaming"
 
     def refresh(self, window_seconds: float) -> None:
@@ -672,12 +717,26 @@ class _EEGMonitor:
                 "sample_rate_hz": rate,
                 "quality_state": self.quality_state,
                 "quality_reasons": list(self.quality_reasons),
+                "battery_percent": self.battery_percent,
                 "impedance_ohms": self.impedance_ohms,
+                "recording_id": self.recording_id,
+                "gap_count": self.gap_count,
+                "largest_gap_seconds": (
+                    None if self.gap_count == 0 else self.largest_gap_seconds
+                ),
+                "mean_receipt_lag_seconds": (
+                    None
+                    if self.receipt_lag_count == 0
+                    else self.receipt_lag_sum_seconds / self.receipt_lag_count
+                ),
+                "max_receipt_lag_seconds": self.receipt_lag_max_seconds,
+                "queue_overflowed": self.queue_overflowed,
             }
 
-    def stopped(self, impedance_ohms: float | None) -> None:
+    def stopped(self, *, recording_id: str | None, queue_overflowed: bool) -> None:
         with self.lock:
-            self.impedance_ohms = impedance_ohms
+            self.recording_id = recording_id
+            self.queue_overflowed = queue_overflowed
             self.status = "stopped"
 
 
@@ -992,7 +1051,9 @@ def run_practice_session(
 
     eeg_monitor: _EEGMonitor | None = None
     eeg_recorder: EEGHDF5Recorder | None = None
-    guardian_thread: threading.Thread | None = None
+    guardian_adapter: Any | None = None
+    guardian_preflight: GuardianPreflight | None = None
+    guardian_started = False
 
     adapter: Any | None = None
     attempt_started_at: float | None = None
@@ -1008,6 +1069,13 @@ def run_practice_session(
     last_eeg_refresh = 0.0
     warned_no_frame = False
     display_started = False
+
+    def drain_guardian(cutoff_timestamp: float | None) -> None:
+        if not guardian_started or guardian_adapter is None or eeg_monitor is None:
+            return
+        for sample in guardian_adapter.drain(cutoff_timestamp=cutoff_timestamp):
+            diagnostics.eeg(sample.timestamp)
+            eeg_monitor.ingest(sample)
 
     try:
         capture = mindlink_config["capture"]
@@ -1045,9 +1113,66 @@ def run_practice_session(
             },
         )
         terminal.setup(
-            "calibration complete; acquisition is OFF "
-            "(video receiver, gaze, EEG, timer, and display are not started)"
+            "calibration complete; MindLink acquisition is OFF "
+            "(video receiver, gaze, timer, and display are not started)"
         )
+
+        if resolved["eeg"]["enabled"]:
+            eeg_pipeline = _build_eeg_pipeline(eeg_config)
+            sample_rate_hz = eeg_config["signal"]["sample_rate_hz"]
+            eeg_monitor = _EEGMonitor(
+                eeg_pipeline,
+                None,
+                sample_rate_hz=sample_rate_hz,
+            )
+            guardian = eeg_config["source"]["guardian"]
+            api_token = load_guardian_api_token(
+                environment_variable=guardian["api_token_env"],
+                token_file=guardian["api_token_file"],
+                base_directory=PROJECT_ROOT,
+            )
+            guardian_adapter = guardian_factory(
+                clock=clock.now,
+                address=guardian["address"],
+                api_token=api_token,
+                debug=guardian["debug"],
+                queue_capacity_samples=guardian["queue_capacity_samples"],
+            )
+            impedance = guardian["impedance"]
+            events.log(
+                0.0,
+                "practice_guardian_preflight_started",
+                {"phase": "setup", "raw_eeg_active": False},
+            )
+            terminal.setup("connecting to Guardian and running preflight")
+            guardian_preflight = guardian_adapter.prepare(
+                impedance_preflight_seconds=(
+                    impedance["duration_seconds"] if impedance["enabled"] else None
+                ),
+                max_impedance_ohms=impedance["max_ohms"],
+                mains_frequency_hz=impedance["mains_frequency_hz"],
+            )
+            eeg_monitor.prepared(guardian_preflight)
+            events.log(
+                0.0,
+                "practice_guardian_preflight_completed",
+                {
+                    "phase": "setup",
+                    "raw_eeg_active": False,
+                    "battery_percent": guardian_preflight.battery_percent,
+                    "impedance_ohms": guardian_preflight.impedance_ohms,
+                },
+            )
+            impedance_text = (
+                "not checked"
+                if guardian_preflight.impedance_ohms is None
+                else f"{guardian_preflight.impedance_ohms:.0f} ohm"
+            )
+            terminal.setup(
+                "Guardian ready; raw EEG is OFF | "
+                f"battery {guardian_preflight.battery_percent:.0f}% | "
+                f"impedance {impedance_text}"
+            )
         terminal.setup("press SPACE to start; Q, Esc, or Ctrl-C to abort")
 
         should_start = start_gate()
@@ -1083,62 +1208,25 @@ def run_practice_session(
                 )
 
             if resolved["eeg"]["enabled"]:
-                eeg_pipeline = _build_eeg_pipeline(eeg_config)
+                assert eeg_monitor is not None
+                assert guardian_adapter is not None
+                guardian = eeg_config["source"]["guardian"]
                 if recording["eeg_enabled"] and eeg_config["recording"]["enabled"]:
                     eeg_recorder = EEGHDF5Recorder(
                         run_directory / "practice_eeg.h5",
                         sample_rate_hz=eeg_config["signal"]["sample_rate_hz"],
                     )
-                eeg_monitor = _EEGMonitor(eeg_pipeline, eeg_recorder)
-                guardian = eeg_config["source"]["guardian"]
-                token_name = guardian["api_token_env"]
-                api_token = os.environ.get(token_name)
-                if not api_token:
-                    raise RuntimeError(
-                        f"EEG practice requires environment variable {token_name}"
-                    )
-                guardian_adapter = guardian_factory(
-                    clock=clock.now,
-                    address=guardian["address"],
-                    api_token=api_token,
-                    debug=guardian["debug"],
+                eeg_monitor.set_recorder(eeg_recorder)
+                guardian_adapter.start(recording_seconds=guardian["recording_seconds"])
+                guardian_started = True
+                eeg_monitor.started()
+                guardian_started_at = clock.now()
+                events.log(
+                    guardian_started_at,
+                    "practice_guardian_recording_started",
+                    {"phase": "attempt"},
                 )
-
-                def on_eeg_sample(sample: EEGSample) -> None:
-                    assert eeg_monitor is not None
-                    diagnostics.eeg(sample.timestamp)
-                    eeg_monitor.ingest(sample)
-
-                def guardian_worker() -> None:
-                    assert eeg_monitor is not None
-                    try:
-                        impedance = guardian["impedance"]
-                        result = guardian_adapter.run(
-                            recording_seconds=guardian["recording_seconds"],
-                            on_sample=on_eeg_sample,
-                            impedance_preflight_seconds=(
-                                impedance["duration_seconds"]
-                                if impedance["enabled"]
-                                else None
-                            ),
-                            max_impedance_ohms=impedance["max_ohms"],
-                            mains_frequency_hz=impedance["mains_frequency_hz"],
-                            stop_requested=state.stop.is_set,
-                        )
-                        eeg_monitor.stopped(result)
-                    except BaseException as exc:
-                        fail("guardian_error", exc)
-                    else:
-                        if not state.stop.is_set():
-                            state.request_stop("guardian_completed")
-
-                guardian_thread = threading.Thread(
-                    target=guardian_worker,
-                    name="practice_guardian",
-                    daemon=True,
-                )
-                terminal.report(clock.now(), "starting Guardian EEG monitor")
-                guardian_thread.start()
+                terminal.report(guardian_started_at, "Guardian raw EEG started")
 
             if display["enabled"]:
                 cv2.namedWindow(display["window_name"], cv2.WINDOW_NORMAL)
@@ -1168,6 +1256,15 @@ def run_practice_session(
             if now - attempt_started_at >= resolved["maximum_duration_seconds"]:
                 state.request_stop("duration_reached")
                 break
+            if guardian_started:
+                try:
+                    drain_guardian(now)
+                    if guardian_adapter.recording_done:
+                        state.request_stop("guardian_completed")
+                        break
+                except BaseException as exc:
+                    fail("guardian_error", exc)
+                    break
             processed = False
             try:
                 frame = scene_queue.get_nowait()
@@ -1310,13 +1407,34 @@ def run_practice_session(
             except BaseException as exc:
                 if state.failure is None:
                     state.request_stop("mindlink_close_error", exc)
-        if guardian_thread is not None:
-            guardian_thread.join(timeout=15.0)
-            if guardian_thread.is_alive() and state.failure is None:
-                state.request_stop(
-                    "guardian_stop_timeout",
-                    RuntimeError("Guardian did not stop within 15 seconds"),
+        if guardian_adapter is not None:
+            if guardian_started:
+                try:
+                    guardian_adapter.stop()
+                    drain_guardian(None)
+                except BaseException as exc:
+                    if state.failure is None:
+                        fail("guardian_stop_error", exc)
+                if eeg_monitor is not None:
+                    eeg_monitor.stopped(
+                        recording_id=getattr(guardian_adapter, "recording_id", None),
+                        queue_overflowed=bool(
+                            getattr(guardian_adapter, "queue_overflowed", False)
+                        ),
+                    )
+                events.log(
+                    clock.now(),
+                    "practice_guardian_recording_stopped",
+                    {
+                        "phase": "attempt",
+                        "recording_id": getattr(guardian_adapter, "recording_id", None),
+                    },
                 )
+            try:
+                guardian_adapter.close()
+            except BaseException as exc:
+                if state.failure is None:
+                    fail("guardian_close_error", exc)
         if latest_interaction is not None:
             try:
                 decisions.finish(gaze_pipeline.finish(last_gaze_timestamp))
@@ -1385,7 +1503,8 @@ def run_practice_session(
         "attempt_duration_seconds": attempt_duration,
         "capture_duration_seconds": capture_duration,
         "eeg_enabled": resolved["eeg"]["enabled"],
-        "eeg_started": eeg_monitor is not None,
+        "eeg_prepared": guardian_preflight is not None,
+        "eeg_started": guardian_started,
         "calibration_result": repr(calibration_result),
         "diagnostics": diagnostic_snapshot,
         "stream_rates_hz": stream_rates_hz,
@@ -1408,6 +1527,28 @@ def run_practice_session(
             "successful": summary["successful"],
         },
     )
+    if eeg_monitor is not None:
+        eeg_status = eeg_monitor.snapshot()
+        recording_id = eeg_status["recording_id"] or "unavailable"
+        mean_lag = eeg_status["mean_receipt_lag_seconds"]
+        max_lag = eeg_status["max_receipt_lag_seconds"]
+        lag_text = (
+            "unavailable"
+            if mean_lag is None or max_lag is None
+            else f"mean {mean_lag:.3f}s / max {max_lag:.3f}s"
+        )
+        guardian_message = (
+            "Guardian summary: "
+            f"samples={eeg_status['sample_count']} | "
+            f"gaps={eeg_status['gap_count']} | "
+            f"receipt lag={lag_text} | "
+            f"recording_id={recording_id} | "
+            f"queue_overflow={eeg_status['queue_overflowed']}"
+        )
+        if clock.started:
+            terminal.report(completed_at, guardian_message)
+        else:
+            terminal.setup(guardian_message)
     final_message = (
         f"stopped: {summary['stop_reason']} | "
         f"successful={summary['successful']} | artifacts={run_directory}"

@@ -16,8 +16,10 @@ source:
   guardian:
     address: null
     api_token_env: IDUN_API_TOKEN
+    api_token_file: .secrets/idun_api_token
     debug: false
     recording_seconds: 2
+    queue_capacity_samples: 15000
     impedance:
       enabled: true
       duration_seconds: 2.0

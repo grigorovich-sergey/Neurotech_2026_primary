@@ -4,12 +4,12 @@ import argparse
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
-import os
 from pathlib import Path
 from typing import Any
 
 from eeg_pipeline.buffer import EEGBuffer
 from eeg_pipeline.contracts import EEGFeatureWindow, EEGSample
+from eeg_pipeline.credentials import load_guardian_api_token
 from eeg_pipeline.guardian import GuardianAdapter
 from eeg_pipeline.pipeline import EEGPipeline
 from eeg_pipeline.processing import EEGFeatureExtractor, EEGPreprocessor, EEGQualityGate
@@ -19,7 +19,8 @@ from foundations.config import load_resolved_config, save_resolved_config
 from foundations.timebase import MonotonicClock
 
 
-DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "eeg_pipeline.yaml"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "eeg_pipeline.yaml"
 
 
 def _new_run_directory(output_root: str) -> Path:
@@ -101,7 +102,11 @@ def _prepare_config(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _feature_summary(
-    feature_window: EEGFeatureWindow, *, impedance_ohms: float | None
+    feature_window: EEGFeatureWindow,
+    *,
+    battery_percent: float | None,
+    impedance_ohms: float | None,
+    recording_id: str | None,
 ) -> dict[str, Any]:
     return {
         "requested_start": feature_window.requested_start,
@@ -118,7 +123,9 @@ def _feature_summary(
             if feature_window.values is None
             else [float(value) for value in feature_window.values]
         ),
+        "guardian_battery_percent": battery_percent,
         "guardian_impedance_ohms": impedance_ohms,
+        "guardian_recording_id": recording_id,
     }
 
 
@@ -143,7 +150,9 @@ def run_eeg_pipeline(config: dict[str, Any]) -> Path:
             recorder.record(sample)
         pipeline.add_sample(sample)
 
+    battery_percent: float | None = None
     impedance_ohms: float | None = None
+    recording_id: str | None = None
     try:
         if source["mode"] == "synthetic":
             synthetic = source["synthetic"]
@@ -164,7 +173,11 @@ def run_eeg_pipeline(config: dict[str, Any]) -> Path:
                 ingest(sample)
         else:
             guardian = source["guardian"]
-            api_token = os.environ.get(guardian["api_token_env"])
+            api_token = load_guardian_api_token(
+                environment_variable=guardian["api_token_env"],
+                token_file=guardian["api_token_file"],
+                base_directory=PROJECT_ROOT,
+            )
             standalone_clock: MonotonicClock | None = None
 
             def standalone_clock_now() -> float:
@@ -178,6 +191,7 @@ def run_eeg_pipeline(config: dict[str, Any]) -> Path:
                 address=guardian["address"],
                 api_token=api_token,
                 debug=guardian["debug"],
+                queue_capacity_samples=guardian["queue_capacity_samples"],
             )
             impedance = guardian["impedance"]
             impedance_ohms = adapter.run(
@@ -189,13 +203,21 @@ def run_eeg_pipeline(config: dict[str, Any]) -> Path:
                 max_impedance_ohms=impedance["max_ohms"],
                 mains_frequency_hz=impedance["mains_frequency_hz"],
             )
+            preflight = adapter.preflight
+            battery_percent = None if preflight is None else preflight.battery_percent
+            recording_id = adapter.recording_id
     finally:
         if recorder is not None:
             recorder.close()
 
     window = resolved["window"]
     feature_window = pipeline.features(window["start_seconds"], window["end_seconds"])
-    summary = _feature_summary(feature_window, impedance_ohms=impedance_ohms)
+    summary = _feature_summary(
+        feature_window,
+        battery_percent=battery_percent,
+        impedance_ohms=impedance_ohms,
+        recording_id=recording_id,
+    )
     with (run_directory / "feature_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True, allow_nan=False)
         handle.write("\n")

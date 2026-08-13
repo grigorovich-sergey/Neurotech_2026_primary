@@ -1,5 +1,7 @@
 import asyncio
 from pathlib import Path
+import threading
+import time
 
 import h5py
 import numpy as np
@@ -10,6 +12,7 @@ from eeg_pipeline.contracts import EEGSample, QualityState
 from eeg_pipeline.guardian import (
     GuardianAdapter,
     GuardianLiveParser,
+    GuardianQueueOverflowError,
     GuardianTimestampMapper,
 )
 from eeg_pipeline.pipeline import EEGPipeline
@@ -73,25 +76,64 @@ def test_guardian_timestamp_mapping_and_live_event_conversion() -> None:
         ).map(1_699_999_999.0)
 
 
-def test_guardian_adapter_injects_shared_clock_and_anchors_after_preflight(
+def test_guardian_persistent_lifecycle_preflights_before_recording_and_drains_causally(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    samples: list[EEGSample] = []
     clock_values = iter((5.0, 5.25))
 
     class FakeClient:
-        handler = None
+        def __init__(self) -> None:
+            self.log: list[str] = []
+            self.thread_ids: list[int] = []
+            self.handler = None
+            self.impedance_running = False
+            self.emitted = threading.Event()
+            self.cleaned = False
 
-        def subscribe_live_insights(self, *, raw_eeg: bool, handler: object) -> None:
+        def mark(self, name: str) -> None:
+            self.log.append(name)
+            self.thread_ids.append(threading.get_ident())
+
+        async def connect_device(self) -> None:
+            self.mark("connect")
+
+        async def check_battery(self) -> int:
+            self.mark("battery")
+            return 83
+
+        async def stream_impedance(self, *, mains_freq_60hz, handler) -> None:
+            self.mark("impedance")
+            assert mains_freq_60hz is True
+            self.impedance_running = True
+            handler(12_000.0)
+            while self.impedance_running:
+                await asyncio.sleep(0)
+
+        def stop_impedance(self) -> None:
+            self.impedance_running = False
+
+        def subscribe_live_insights(self, *, raw_eeg: bool, handler) -> None:
+            self.mark("subscribe")
             assert raw_eeg is True
             self.handler = handler
 
-        async def start_recording(self, *, recording_timer: int) -> None:
-            assert recording_timer == 1
+        async def start_recording(self, *, recording_timer: int) -> str:
+            self.mark("record")
+            assert recording_timer == 60
             assert self.handler is not None
-            self.handler(
-                {"raw_eeg": [{"timestamp": 1_700_000_000.004, "ch1": 4.5}]}
-            )
+            self.handler({"raw_eeg": [{"timestamp": 1_700_000_000.004, "ch1": 4.5}]})
+            self.emitted.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cleaned = True
+            return "recording-123"
+
+        def get_recording_id(self) -> str:
+            return "recording-123"
+
+        async def disconnect_device(self) -> None:
+            self.mark("disconnect")
 
     client = FakeClient()
     monkeypatch.setattr("eeg_pipeline.guardian.time.time", lambda: 1_700_000_000.0)
@@ -100,119 +142,157 @@ def test_guardian_adapter_injects_shared_clock_and_anchors_after_preflight(
         client_factory=lambda **_: client,
     )
 
-    adapter.run(
-        recording_seconds=1,
-        on_sample=samples.append,
-        impedance_preflight_seconds=None,
+    preflight = adapter.prepare(
+        impedance_preflight_seconds=0.01,
+        max_impedance_ohms=300_000.0,
+        mains_frequency_hz=60,
     )
+    assert preflight.battery_percent == 83.0
+    assert preflight.impedance_ohms == 12_000.0
+    assert client.log[:3] == ["connect", "battery", "impedance"]
+    assert "record" not in client.log
+
+    adapter.start(recording_seconds=60)
+    assert client.emitted.wait(1.0)
+    assert adapter.drain(cutoff_timestamp=5.003) == ()
+    samples = adapter.drain(cutoff_timestamp=5.004)
+    adapter.stop()
+    adapter.close()
 
     assert adapter.mapper is not None
     assert adapter.mapper.anchor_run_timestamp == 5.0
-    assert adapter.mapper.anchor_unix_timestamp == 1_700_000_000.0
-    assert len(samples) == 1
     assert samples[0].timestamp == pytest.approx(5.004, abs=1e-6)
-    assert samples[0].value_uv == 4.5
-    assert samples[0].vendor_timestamp_unix == 1_700_000_000.004
     assert samples[0].host_receipt_timestamp == 5.25
-
-
-def test_guardian_adapter_cooperatively_stops_and_awaits_cleanup() -> None:
-    calls = 0
-
-    class FakeClient:
-        started = False
-        cleaned = False
-
-        def subscribe_live_insights(self, *, raw_eeg: bool, handler: object) -> None:
-            assert raw_eeg is True
-
-        async def start_recording(self, *, recording_timer: int) -> None:
-            self.started = True
-            try:
-                await asyncio.Event().wait()
-            finally:
-                self.cleaned = True
-
-    def stop_requested() -> bool:
-        nonlocal calls
-        calls += 1
-        return calls >= 2
-
-    client = FakeClient()
-    adapter = GuardianAdapter(clock=lambda: 0.0, client_factory=lambda **_: client)
-
-    adapter.run(
-        recording_seconds=60,
-        on_sample=lambda _: None,
-        impedance_preflight_seconds=None,
-        stop_requested=stop_requested,
-    )
-
-    assert client.started
+    assert samples[0].value_uv == 4.5
     assert client.cleaned
+    assert adapter.recording_id == "recording-123"
+    assert client.log[-1] == "disconnect"
+    assert len(set(client.thread_ids)) == 1
 
 
-def test_guardian_adapter_stops_during_impedance_preflight() -> None:
-    calls = 0
-
+def test_guardian_preflight_hard_gates_impedance_and_disconnects() -> None:
     class FakeClient:
         impedance_running = False
-        impedance_stopped = False
         recording_started = False
+        disconnected = False
 
-        async def stream_impedance(
-            self, *, mains_freq_60hz: bool, handler: object
-        ) -> None:
+        async def connect_device(self) -> None:
+            pass
+
+        async def check_battery(self) -> int:
+            return 75
+
+        async def stream_impedance(self, *, mains_freq_60hz, handler) -> None:
             self.impedance_running = True
+            handler(400_000.0)
             while self.impedance_running:
                 await asyncio.sleep(0)
 
         def stop_impedance(self) -> None:
             self.impedance_running = False
-            self.impedance_stopped = True
 
         async def start_recording(self, *, recording_timer: int) -> None:
             self.recording_started = True
 
-    def stop_requested() -> bool:
-        nonlocal calls
-        calls += 1
-        return calls >= 3
+        async def disconnect_device(self) -> None:
+            self.disconnected = True
 
     client = FakeClient()
     adapter = GuardianAdapter(clock=lambda: 0.0, client_factory=lambda **_: client)
 
-    adapter.run(
-        recording_seconds=60,
-        on_sample=lambda _: None,
-        impedance_preflight_seconds=10.0,
-        stop_requested=stop_requested,
-    )
+    with pytest.raises(RuntimeError, match="not below configured"):
+        adapter.prepare(impedance_preflight_seconds=0.01)
+    adapter.close()
 
-    assert client.impedance_stopped
+    assert client.disconnected
     assert not client.recording_started
 
 
-def test_guardian_adapter_propagates_recording_failure_with_stop_callback() -> None:
+def test_guardian_queue_overflow_is_a_hard_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class FakeClient:
-        def subscribe_live_insights(self, *, raw_eeg: bool, handler: object) -> None:
-            assert raw_eeg is True
+        def __init__(self) -> None:
+            self.handler = None
+
+        async def connect_device(self) -> None:
+            pass
+
+        async def check_battery(self) -> int:
+            return 100
+
+        def subscribe_live_insights(self, *, raw_eeg: bool, handler) -> None:
+            self.handler = handler
+
+        async def start_recording(self, *, recording_timer: int) -> str:
+            assert self.handler is not None
+            self.handler(
+                {
+                    "raw_eeg": [
+                        {"timestamp": 1_700_000_000.004, "ch1": 1.0},
+                        {"timestamp": 1_700_000_000.008, "ch1": 2.0},
+                    ]
+                }
+            )
+            return "overflow-recording"
+
+        def get_recording_id(self) -> str:
+            return "overflow-recording"
+
+        async def disconnect_device(self) -> None:
+            pass
+
+    client = FakeClient()
+    monkeypatch.setattr("eeg_pipeline.guardian.time.time", lambda: 1_700_000_000.0)
+    adapter = GuardianAdapter(
+        clock=lambda: 0.0,
+        queue_capacity_samples=1,
+        client_factory=lambda **_: client,
+    )
+    adapter.prepare(impedance_preflight_seconds=None)
+    adapter.start(recording_seconds=1)
+    deadline = time.monotonic() + 1.0
+    while not adapter.recording_done and time.monotonic() < deadline:
+        time.sleep(0.001)
+
+    with pytest.raises(GuardianQueueOverflowError, match="overflowed"):
+        adapter.drain()
+    assert adapter.queue_overflowed
+    with pytest.raises(GuardianQueueOverflowError):
+        adapter.close()
+
+
+def test_guardian_recording_failure_surfaces_on_integration_thread() -> None:
+    class FakeClient:
+        async def connect_device(self) -> None:
+            pass
+
+        async def check_battery(self) -> int:
+            return 50
+
+        def subscribe_live_insights(self, *, raw_eeg: bool, handler) -> None:
+            pass
 
         async def start_recording(self, *, recording_timer: int) -> None:
             raise RuntimeError("recording failed")
+
+        async def disconnect_device(self) -> None:
+            pass
 
     adapter = GuardianAdapter(
         clock=lambda: 0.0,
         client_factory=lambda **_: FakeClient(),
     )
+    adapter.prepare(impedance_preflight_seconds=None)
+    adapter.start(recording_seconds=1)
+    deadline = time.monotonic() + 1.0
+    while not adapter.recording_done and time.monotonic() < deadline:
+        time.sleep(0.001)
 
     with pytest.raises(RuntimeError, match="recording failed"):
-        adapter.run(
-            recording_seconds=1,
-            on_sample=lambda _: None,
-            impedance_preflight_seconds=None,
-            stop_requested=lambda: False,
-        )
+        adapter.drain()
+    with pytest.raises(RuntimeError, match="recording failed"):
+        adapter.close()
 
 
 def test_window_is_closed_and_never_includes_sample_after_cutoff() -> None:
