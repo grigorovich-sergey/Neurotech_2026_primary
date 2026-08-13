@@ -138,6 +138,54 @@ Current Instance 2 applies a newly returned score on the following gaze update.
 That N-to-N+1 ordering remains intentional: the EEG cutoff cannot influence dwell
 already accumulated on update N.
 
+### Live Guardian feature source
+
+Live attempts should pass `GuardianEEGFeatureSource`, not a bare `EEGPipeline`, to
+`ExperimentController.evaluate_update(...)`. The source synchronously drains the
+merged persistent `GuardianAdapter` through the exact feature-window end, records
+and ingests only those samples on the caller's Integration thread, and then asks
+the unchanged pipeline for the closed feature window.
+
+```python
+from experiment_learning.guardian_source import GuardianEEGFeatureSource
+
+guardian = GuardianAdapter(clock=attempt_clock.now, ...)
+guardian.prepare(...)  # before SPACE; raw EEG remains off
+
+# At SPACE, start the shared attempt clock before raw EEG.
+attempt_clock.start()
+guardian.start(recording_seconds=session_recording_seconds)
+
+eeg_source = GuardianEEGFeatureSource(
+    guardian=guardian,
+    pipeline=eeg_pipeline,
+    recorder=eeg_recorder,
+)
+
+# Safe periodic ingestion at the latest processed scientific timestamp prevents
+# the bounded Guardian queue from filling during long periods without predictions.
+eeg_source.drain_through(latest_processed_timestamp)
+```
+
+`features(start, end)` always performs another
+`guardian.drain(cutoff_timestamp=end)` immediately before feature extraction. It
+fails loudly if the adapter returns any sample after `end`. Guardian acquisition
+failures, including queue overflow, propagate unchanged; they must fail the
+attempt rather than become missing EEG or a fabricated fallback.
+
+Normal completion is ordered explicitly:
+
+```python
+guardian.stop()
+eeg_source.drain_remaining()
+guardian.close()
+```
+
+Keep final drain and close in independent cleanup blocks so disconnect is still
+attempted if stop or drain fails. `recording_id`, battery, impedance, queue status,
+and source ingestion counters are diagnostics/provenance only and must not enter
+the engagement index or frozen policy.
+
 ### Core construction example
 
 ```python
@@ -198,7 +246,7 @@ if observation is not None and interaction.active_episode is not None:
     decision = controller.evaluate_update(
         interaction.active_episode,
         observation,
-        eeg_pipeline,
+        eeg_source,
         instructed_intention=current_trial_instruction,
     )
     held_score = decision.intent_score
@@ -366,6 +414,11 @@ updated before the integrated runner can use this corrected subsystem. Specifica
 - replace checkpoint allocation/resume with schedule + frozen-policy attempt binding;
 - construct dwell parameters from the active condition's frozen policy;
 - replace `consider_prediction` with `evaluate_update`;
+- prepare/start the persistent Guardian around SPACE and pass
+  `GuardianEEGFeatureSource` so every live EEG window drains through its exact
+  cutoff on the Integration thread;
+- periodically call `drain_through(latest_processed_timestamp)` to prevent bounded
+  queue buildup, then stop, final-drain, and close in independent cleanup blocks;
 - replace `on_dwell_trigger`/`on_episode_end`/`button_press` with the explicit
   action/no-action/feedback operations documented above;
 - pass `action_gate_open` to Instance 2 and apply cancellation instructions;
