@@ -1,124 +1,170 @@
-# Instance 5 — Integration + scientific verification
+# Instance 5 — Integration and scientific verification
 
-This layer connects the already-approved gaze interaction, EEG, and experimental
-learning subsystems into one pre-smart-glasses experiment. It does not redefine
-their algorithms or scientific contracts.
+Instance 5 connects the approved gaze, EEG, and frozen-policy learning
+subsystems. It owns attempt lifecycle, scientific-time ordering, cross-subsystem
+routing, immutable successful-session persistence, and between-session training.
+It does not change object detection, EEG calculations, the engagement-index
+formula, or feedback labels.
 
 ## Quick start
 
-From the repository root after installing the project dependencies:
+Install the project, then run the deterministic hardware-free path:
 
 ```bash
+python -m pip install -e ".[dev]"
 python scripts/run_integrated_experiment.py
 ```
 
-The default is hardware-free: Foundation `VirtualGlasses`, the verification-only
-synthetic vision adapter, Instance 3 synthetic EEG, deterministic synthetic
-press/timeout feedback, real gaze association/dwell, and real paired River models.
-It runs for 12 seconds and produces an inspectable run under `runs/integration/`.
+The default uses virtual glasses, deterministic synthetic vision, synthetic EEG,
+and deterministic press/timeout feedback for 12 scientific seconds. A successful
+attempt writes a timestamped directory under `runs/integration/` and advances the
+participant by exactly one predetermined schedule row.
 
-Use a partial YAML override for any non-default run:
+Partial YAML overrides are recursively merged with
+`configs/integration.yaml`. Unknown keys are rejected, and every run saves all
+four resolved configurations.
 
 ```bash
 python scripts/run_integrated_experiment.py --config path/to/override.yaml
 ```
 
-Unknown override keys are rejected by `foundations.config`; every run persists the
-fully resolved integration, gaze, EEG, and learning configurations.
+## Frozen policy and schedule binding
 
-## Interfaces and enforced ordering
+Integration no longer uses mutable pickle checkpoints, parity allocation, or
+online learning. `participant.artifact_directory` contains immutable policies,
+completed sessions, and training reports. The next session number is the first
+number after the contiguous successful `completed_session_NNN.json` artifacts.
 
-The integration consumes existing public contracts directly:
+The condition CSV must retain this exact header:
 
-- `foundations.contracts.SceneFrame` / `GazeSample` for scene and gaze input;
-- `GazeInteractionPipeline.process_scene()` / `process_gaze()` for association,
-  candidate episodes and adaptive dwell;
-- `EEGPipeline.features(start, cutoff)` for the closed EEG feature window;
-- `observation_from_interaction()` and `ExperimentController` for the paired G/E
-  prediction, feedback, scoring and learning path.
+```csv
+sequence_id,session_number,active_condition
+```
 
-For each gaze timestamp the runner performs these operations in order:
+Before an attempt, the runner:
 
-1. resolve any button press or timeout due by that timestamp;
-2. ingest raw EEG only through that timestamp;
-3. call `process_gaze(..., intent_score=held_active_score)` using only a score
-   frozen on an earlier gaze update for the same episode;
-4. route any ended episode and dwell trigger to `ExperimentController`;
-5. if an episode ended retrospectively through the gaze-gap grace period, advance
-   feedback time again to the current gaze timestamp;
-6. build the current-match observation and call `consider_prediction()`;
-7. hold its active-model score for the next gaze update and later updates of that
-   same episode only.
+1. hashes and loads the approved condition schedule;
+2. resolves `participant.sequence_id` for the next successful session number;
+3. loads `policy_session_NNN.json` and verifies participant, session, schedule,
+   and policy SHA-256 bindings;
+4. builds Instance 2 dwell values from
+   `policy.dwell_parameters(active_condition)`;
+5. records the exact attempt, schedule, condition, and policy identities.
 
-This makes the N -> N+1 dwell rule mechanical. A direct object/episode identity
-switch clears the old score before the new episode's first dwell update. A temporary
-no-match inside the same episode may retain the already-frozen score, but missing
-gaze never accumulates dwell.
+Session 1 creates the immutable cold-start policy if it is absent. After a
+successful session N, the runner persists its completed-session artifact and
+calls the deterministic trainer once to create policy N+1. A failed attempt
+creates neither a completed-session artifact nor policy N+1, so the next run
+retries the same session and condition with the same frozen policy.
 
-The shadow probability is never passed to dwell. Instance 4 remains authoritative
-for strict paired EEG skip, the one-button label truth table, score-before-update,
-and common paired learning. No future scene can be selected by the Instance 2
-associator, and no EEG after a prediction cutoff is selected by the Instance 3
-closed-window path.
+## Causal processing order
+
+For every scene or gaze cutoff, Integration drains EEG only through the latest
+processed scientific timestamp. For a confirmed gaze update it then:
+
+1. resolves feedback presses/timeouts due by the cutoff;
+2. passes the score frozen on update N-1 to Instance 2 update N;
+3. routes an ended episode or displayed action to the experiment controller;
+4. calls `evaluate_update(...)` for the current confirmed match;
+5. holds the returned episode score for update N+1.
+
+That N-to-N+1 hold prevents EEG ending at update N from changing dwell already
+accumulated on N. A direct track switch clears the old held score. The action gate
+is closed while feedback is pending; newer candidates may remain provisional,
+and accepted feedback cancellation instructions are applied through Instance 2's
+typed `FEEDBACK_INTERRUPTION` cancellation path.
+
+`evaluate_update` receives an EEG feature source, never a bare `EEGPipeline`.
+Each `features(start, end)` request performs a final drain through exactly `end`
+before calculating the unchanged Instance 3 feature window. Future samples are
+not exposed. Battery, impedance, queue overflow, SDK acquisition, and cleanup
+failures are hard attempt errors, not missing-EEG fallbacks. Guardian diagnostics
+are provenance only and never model features.
 
 ## Input and feedback modes
 
-| `input.mode` | Scene/gaze path | Vision path | Typical feedback |
+| Mode | Scene/gaze source | Vision | Typical feedback |
 | --- | --- | --- | --- |
-| `synthetic` | Foundation `VirtualGlasses` | deterministic verification adapter | `synthetic` |
-| `replay` | Foundation scene/gaze HDF5 replay | deterministic verification adapter | `replay` JSONL |
-| `video` | Instance 2.5 CFR video + gaze CSV or mouse | real YOLOE + ByteTrack | `keyboard` |
+| `synthetic` | Foundation virtual glasses | deterministic verification adapter | `synthetic` |
+| `replay` | recorded glasses HDF5 | deterministic verification adapter | `replay` |
+| `video` | CFR video plus gaze CSV or mouse | YOLOE + ByteTrack | `keyboard` |
 
-The synthetic vision adapter exists only because Foundation virtual images are
-random pixels. During each configured visible interval it supplies one deterministic
-tracked full-frame object so that the real association, episode, dwell, EEG and
-learning paths are exercised. Prerecorded-video mode uses the actual YOLOE +
-ByteTrack adapters instead.
+Synthetic vision exists only because virtual frames are random pixels. Video mode
+uses the configured real YOLOE device (including CUDA when available) and the
+ByteTrack adapter.
 
-EEG source selection stays in the authoritative EEG configuration. The integrated
-path accepts its `source.mode: synthetic` or `source.mode: replay`; Guardian live
-acquisition remains an Instance 3/hardware concern.
+Feedback modes are:
 
-Feedback options are:
+- `synthetic`: deterministic press/no-press cycle; labels are still derived only
+  by Instance 4's feedback truth table;
+- `replay`: timestamped `integration_feedback_press` events from an earlier log,
+  with strict pending-episode identity checks;
+- `keyboard`: the configured OpenCV key, normally SPACE, for visible paced video.
 
-- `synthetic`: cycles `feedback.synthetic.press_cycle`; `false` means no press and
-  lets Instance 4 time out, while `true` schedules a press after
-  `press_delay_seconds`. The integration never derives the training label itself.
-- `replay`: reads `integration_feedback_press` events from an earlier integrated
-  `events.jsonl` (or, for compatibility, pressed Instance 4 result records) and
-  fails if the recorded episode identity does not match the currently pending one.
-- `keyboard`: key code 32 (space) by default. It is intended for paced video with
-  the OpenCV window visible; a press is timestamped at the current scientific gaze
-  time. This is a pre-hardware stand-in, not a Guardian/glasses button protocol.
+Replay and video may run unpaced with synthetic/replayed EEG. Live Guardian input
+requires real-time scene/gaze pacing: replay must set `source.replay_paced: true`,
+and video must set `input.video.paced: true`. Synthetic glasses are automatically
+paced when live Guardian is selected.
 
-## Main configuration options
+## Live Guardian attempts
 
-`configs/integration.yaml` is the complete integration-level default.
+Install the SDK extra and provide the token without putting it in YAML:
+
+```bash
+python -m pip install -e ".[dev,guardian]"
+export IDUN_API_TOKEN="..."
+```
+
+The Git-ignored `.secrets/idun_api_token` single-line file is the fallback. A
+minimal EEG override for the default 12-second attempt is:
+
+```yaml
+source:
+  mode: live
+  guardian:
+    recording_seconds: 13
+```
+
+`recording_seconds` must exceed `session.maximum_duration_seconds`, leaving a
+whole-second timer margin around startup and the final scientific cutoff.
+
+The live lifecycle is intentionally strict:
+
+1. construct `GuardianAdapter(clock=attempt_clock.now, ...)`;
+2. call `prepare(...)` before SPACE, with raw EEG off;
+3. show battery and optional impedance results;
+4. on SPACE, start the attempt clock before `guardian.start(...)`;
+5. construct `GuardianEEGFeatureSource` with the EEG pipeline and raw recorder;
+6. periodically drain through the latest processed scientific timestamp;
+7. on completion or failure, attempt `stop()`, `drain_remaining()`, and `close()`
+   in independent cleanup blocks.
+
+All queue draining, raw HDF5 writes, and `EEGPipeline` mutation occur synchronously
+on the Integration thread. The SDK callback only appends canonical samples to the
+bounded handoff queue. If the operator presses Q or Esc before SPACE, acquisition
+never starts and no completed-session artifact is created.
+
+## Configuration reference
 
 | Key | Meaning |
 | --- | --- |
-| `output_root` | Root for timestamp-named integrated run directories. |
-| `participant.id` | Pseudonymous participant identifier. |
-| `participant.sequence_index` | Fixed participant sequence index controlling ABAB/BABA parity. |
-| `participant.checkpoint_path` | Trusted-local Instance 4 participant checkpoint. |
-| `participant.resume_checkpoint` | Load an existing compatible checkpoint when present. |
-| `session.id_prefix` | Prefix; the allocated schedule index is appended as `-001`, `-002`, etc. |
+| `output_root` | Root for timestamped run directories. |
+| `participant.id` | Pseudonymous participant identity. |
+| `participant.sequence_id` | Approved condition-schedule sequence, such as `g-first`. |
+| `participant.artifact_directory` | Immutable policy/session/report lineage. |
+| `session.id_prefix` | Human-readable session ID prefix. |
+| `session.maximum_duration_seconds` | Hard attempt deadline. |
 | `input.mode` | `synthetic`, `replay`, or `video`. |
-| `input.record_glasses` | Persist canonical scene/gaze input as Foundation HDF5. |
-| `input.video.*` | Video path, `file`/`mouse` gaze mode, CSV path, pacing, window and diagnostic-frame options. |
+| `input.record_glasses` | Save canonical scene/gaze HDF5. |
+| `input.video.*` | Video/gaze paths, pacing, display, and diagnostic-frame options. |
 | `feedback.mode` | `synthetic`, `replay`, or `keyboard`. |
-| `synthetic_vision.*` | Verification-only object warmup/visible/blank timing and label. |
-| `analysis.enabled` | Regenerate summary JSON and learning-curve CSV at successful completion. |
-| `subsystem_config_overrides.*` | Optional partial YAML overrides for authoritative gaze, EEG and learning defaults. |
-
-`configs/integration_gaze.yaml` and `configs/integration_eeg.yaml` are small default
-partial overrides used only to lengthen the hardware-free integrated run. Dwell,
-EEG processing/quality thresholds, learning features/models and feedback semantics
-remain defined by their authoritative subsystem configurations.
+| `synthetic_vision.*` | Verification-only object timing and label. |
+| `analysis.enabled` | Generate JSON summary and learning-curve CSV. |
+| `subsystem_config_overrides.*` | Partial gaze, EEG, and learning YAML overrides. |
 
 ### Replay example
 
-Create a partial gaze override:
+Gaze override:
 
 ```yaml
 source:
@@ -126,7 +172,7 @@ source:
   replay_paced: false
 ```
 
-and a partial EEG override:
+EEG override:
 
 ```yaml
 source:
@@ -135,11 +181,12 @@ source:
   replay_paced: false
 ```
 
-Then point an integration override at them and the original feedback log:
+Integration override:
 
 ```yaml
 participant:
-  checkpoint_path: runs/participants/replay-check-P001.pkl
+  id: replay-check-P001
+  artifact_directory: runs/participants/replay-check-P001
 input:
   mode: replay
 feedback:
@@ -151,8 +198,8 @@ subsystem_config_overrides:
   eeg_pipeline: path/to/replay_eeg.yaml
 ```
 
-Use a fresh checkpoint for a from-scratch reproducibility comparison; using an
-existing participant checkpoint intentionally continues that participant's learning.
+Use a new participant artifact directory for a from-scratch reproducibility
+comparison. Reusing one intentionally advances that participant's schedule.
 
 ### Prerecorded video example
 
@@ -169,74 +216,48 @@ feedback:
   mode: keyboard
 ```
 
-Set `gaze_mode: mouse` and `gaze_csv_path: null` for the mouse-gaze stand-in. Real
-YOLOE weights must be available/resolvable by Ultralytics for video mode.
+Use `gaze_mode: mouse` and `gaze_csv_path: null` for the mouse stand-in.
 
-## Outputs
+## Outputs and failure semantics
 
-One successful integrated run may contain:
+A successful run may contain:
 
 | Artifact | Purpose |
 | --- | --- |
-| `events.jsonl` | Foundation JSONL stream including Instance 4 predictions/results plus integration episode/dwell/session events. |
-| `raw_glasses.h5` | Canonical scene/gaze input when `input.record_glasses: true`. |
-| `raw_eeg.h5` | Raw EEG supplied to the integrated pipeline when the resolved EEG config enables recording. |
-| `resolved_integration_config.json` | Fully resolved integration settings. |
-| `resolved_gaze_interaction_config.json` | Fully resolved authoritative gaze settings. |
-| `resolved_eeg_pipeline_config.json` | Fully resolved authoritative EEG settings. |
-| `resolved_experiment_learning_config.json` | Fully resolved authoritative learning settings. |
-| `analysis_summary.json` | Descriptive paired G/E metrics, skips/reasons, outcomes, latency and controlled-intention agreement where present. |
-| `learning_curve.csv` | Per-result cumulative G/E accuracy and F1 for learning/sample-efficiency inspection. |
-| `diagnostics/` | Optional rendered frames in video mode. |
+| `events.jsonl` | Attempt, policy decision, episode record, feedback, lifecycle, and provenance events. |
+| `raw_glasses.h5` | Canonical scene/gaze input when enabled. |
+| `raw_eeg.h5` | Raw EEG recorded before pipeline ingestion when enabled. |
+| `completed_session.json` | Run-local copy of the immutable successful trainer input. |
+| `resolved_*_config.json` | Fully resolved Integration and subsystem settings. |
+| `analysis_summary.json` | Descriptive G/E outcomes, exclusions, feedback labels, and latency. |
+| `learning_curve.csv` | Cumulative descriptive G/E accuracy and F1 over eligible records. |
+| `diagnostics/` | Optional rendered video frames. |
 
-The participant checkpoint is stored at `participant.checkpoint_path`, not copied
-into each run. It is the existing Instance 4 atomic, trusted-local pickle format.
+The participant directory additionally receives
+`completed_session_NNN.json`, `policy_session_NNN.json`, and
+`policy_session_NNN.training_report.json`.
 
-`analysis_summary.json` treats `common_label` correctly as feedback-derived, not as
-independently observed ground truth. False activations and missed intentions are
-therefore descriptive against that common feedback label. Selection latency is
-episode-start to action outcome for action episodes with a persisted episode start.
+Abnormal processing or hardware failure emits `integration_session_incomplete`
+after cleanup attempts and re-raises the original error. Incomplete attempts are
+never trainer inputs. There is no mid-attempt sensor rewind or online model state
+to resume.
 
 ## Offline analysis
 
-Analysis is generated only from persisted JSONL scientific records. To regenerate
-it later, create a small partial override such as:
-
-```yaml
-events_path: runs/integration/<run-id>/events.jsonl
-output_directory: runs/integration/<run-id>
-```
-
-and run:
+Analysis reads only persisted `experiment_policy_decision` and
+`experiment_episode_training_record` events. To regenerate:
 
 ```bash
 python scripts/analyze_integrated_experiment.py --config path/to/analysis_override.yaml
 ```
 
-This also writes `resolved_analysis_config.json` as the analysis entry point's
-required resolved configuration provenance.
+`common_label` remains feedback-derived rather than independently observed truth;
+reported false activations and missed intentions are descriptive against that
+label.
 
-## Checkpoint/restart behavior
+## Hardware validation still required
 
-The runner allocates the next ABAB/BABA schedule slot and atomically checkpoints it
-before processing session data. Each resolved feedback result checkpoints the paired
-models through Instance 4.
-
-On graceful source exhaustion, the active candidate is explicitly ended and its
-legitimate feedback window is completed by a scheduled press or timeout. On abnormal
-interruption, no synthetic label is created for an unresolved episode; the event log
-records `integration_session_incomplete`. Restart loads the last compatible participant
-checkpoint and starts a new schedule slot/session rather than rewinding sensors and
-resuming mid-session. This avoids duplicate scoring/training.
-
-At successful completion, G and E training-count deltas must both equal the number
-of resolved session results and the cumulative paired training counts must remain
-equal. A mismatch fails loudly instead of guessing recovery state.
-
-## Hardware-only work still deferred
-
-The integrated logic can be verified without smart glasses or Guardian hardware.
-Still deferred are the future glasses SDK adapter, vendor gaze calibration/coordinate
-conversion, clock synchronization, device latency/dropout tuning, physical feedback
-button integration, real Guardian signal-quality threshold validation, and final
-YOLOE/ByteTrack performance tuning on the actual scene-camera stream.
+The deterministic and fake-Guardian paths are covered by tests. Real Guardian
+battery/impedance thresholds, sustained queue capacity, device latency and clock
+alignment, physical feedback hardware, smart-glasses SDK ingestion, and final
+YOLOE/ByteTrack performance still require pilot validation on the target system.
