@@ -68,7 +68,10 @@ python scripts/run_practice_session.py --with-eeg
 ```
 
 Guardian EEG is optional and monitor-only; it never changes practice dwell.
-Press `Q` or `Esc` to stop. See
+Complete calibration first, then press `SPACE` in the terminal to create a fresh
+video receiver and start the attempt clock, gaze/video streams, display, and
+optional EEG. Nothing is acquired during the post-calibration wait. Press `Q` or
+`Esc` to stop after starting. See
 [docs/practice_session.md](docs/practice_session.md) for setup, displayed
 diagnostics, artifacts, and current hardware-validation limitations.
 

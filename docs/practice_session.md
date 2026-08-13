@@ -1,9 +1,10 @@
 # Live practice session
 
 This diagnostic checks the complete live glasses path without creating an
-experimental session or training input. It runs MindLink calibration, fresh
-post-calibration scene capture, canonical gaze, YOLOE/ByteTrack, gaze association,
-and fixed gaze-only dwell. Guardian EEG can be enabled as a monitor-only source.
+experimental session or training input. It runs MindLink calibration, waits for an
+explicit operator start, then runs fresh scene capture, canonical gaze,
+YOLOE/ByteTrack, gaze association, and fixed gaze-only dwell. Guardian EEG can be
+enabled as a monitor-only source.
 Practice inherits the gaze-interaction detector defaults: a `0.45` confidence
 threshold and the category allowlist for chair, laptop, cellphone, tablet, and wall
 poster. Only accepted categories are tracked, displayed, and eligible for a
@@ -26,10 +27,31 @@ python scripts/run_practice_session.py --with-eeg
 python scripts/run_practice_session.py --config path/to/partial_override.yaml --with-eeg
 ```
 
-Press `Q` or `Esc` in the display to stop. The same integration-owned
-`MonotonicClock` is passed to MindLink and Guardian. Guardian shutdown is
-cooperative: the practice stop signal cancels and awaits the SDK recording task so
-its cleanup can finish.
+The launch lifecycle is intentionally strict:
+
+```text
+connect tracker
+-> calibrate fully
+-> wait with acquisition OFF
+-> press SPACE
+-> start the attempt clock, Guardian (if enabled), display, and fresh MindLink capture
+```
+
+The SPACE gate reads one console key; Enter is not required. `Q`, `Esc`, or Ctrl-C
+at the gate aborts cleanly without creating a video receiver, enabling gaze streams,
+starting Guardian, opening the video display, or starting the attempt clock. Sensor
+recording files are also created only after SPACE.
+
+`MindLinkAdapter.start_capture()` is deliberately called only after the gate. It
+creates a new `VideoReceiver` at that point; no receiver or video transport is
+pre-created or preserved through calibration. This lifecycle is mandatory for the
+future experimental runner as well because the target hardware stopped delivering
+frame callbacks when a receiver survived calibration and a post-calibration pause.
+
+After acquisition starts, press `Q` or `Esc` in the display to stop. The same
+integration-owned attempt clock, whose zero is the SPACE signal, is passed to
+MindLink and Guardian. Guardian shutdown is cooperative: the practice stop signal
+cancels and awaits the SDK recording task so its cleanup can finish.
 
 The display includes recognized objects, a high-contrast labelled gaze bullseye,
 current gaze validity/coordinates, current candidate, fixed dwell,
@@ -39,9 +61,13 @@ practice dwell. The configured 30 Hz ByteTrack rate is provisional: tune it toge
 with the lost-track buffer and association age after measuring the effective
 processed-scene rate on the target computer.
 
-The terminal prints timestamped lifecycle notices plus selection triggers, no-frame
-warnings, failures, and the final stop reason/artifact directory. It deliberately
-does not print every frame or gaze sample.
+Before SPACE, terminal notices use the explicit `[practice setup]` prefix. After
+SPACE, attempt-relative timestamps start at zero. The terminal reports Instance 2's
+actual transition outputs: candidate/episode starts, candidate switches, temporary
+no-match pauses and resumptions, episode-end reasons, dwell crossings at 25/50/75%,
+dwell triggers, and resulting practice selections. It also prints no-frame warnings,
+failures, and the final stop reason/artifact directory. It deliberately does not
+print every frame or gaze sample or recreate Instance 2's decision logic.
 
 Artifacts are written below `runs/practice/<run-id>/`. They are deliberately outside
 the participant/session hierarchy and never include a completed-session record,
