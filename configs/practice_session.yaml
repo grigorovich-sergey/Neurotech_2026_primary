@@ -4,6 +4,9 @@ maximum_duration_seconds: 3600.0
 eeg:
   enabled: false
 
+terminal:
+  verbose_decisions: true
+
 recording:
   glasses_enabled: false
   eeg_enabled: true

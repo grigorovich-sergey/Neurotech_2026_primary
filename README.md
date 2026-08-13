@@ -65,13 +65,16 @@ experimental session or training input:
 ```bash
 python scripts/run_practice_session.py
 python scripts/run_practice_session.py --with-eeg
+python scripts/run_practice_session.py --concise-decisions
 ```
 
 Guardian EEG is optional and monitor-only; it never changes practice dwell.
 Complete calibration first, then press `SPACE` in the terminal to create a fresh
 video receiver and start the attempt clock, gaze/video streams, display, and
 optional EEG. Nothing is acquired during the post-calibration wait. Press `Q` or
-`Esc` to stop after starting. See
+`Esc` to stop after starting. Verbose decision reporting is the default;
+`--concise-decisions` retains lifecycle, selection, warning, error, and stop output
+while suppressing candidate/dwell transition lines. See
 [docs/practice_session.md](docs/practice_session.md) for setup, displayed
 diagnostics, artifacts, and current hardware-validation limitations.
 
