@@ -24,6 +24,8 @@ export IDUN_API_TOKEN=...
 ```text
 python scripts/run_practice_session.py
 python scripts/run_practice_session.py --with-eeg
+python scripts/run_practice_session.py --verbose-decisions
+python scripts/run_practice_session.py --concise-decisions
 python scripts/run_practice_session.py --config path/to/partial_override.yaml --with-eeg
 ```
 
@@ -62,12 +64,18 @@ with the lost-track buffer and association age after measuring the effective
 processed-scene rate on the target computer.
 
 Before SPACE, terminal notices use the explicit `[practice setup]` prefix. After
-SPACE, attempt-relative timestamps start at zero. The terminal reports Instance 2's
-actual transition outputs: candidate/episode starts, candidate switches, temporary
-no-match pauses and resumptions, episode-end reasons, dwell crossings at 25/50/75%,
-dwell triggers, and resulting practice selections. It also prints no-frame warnings,
-failures, and the final stop reason/artifact directory. It deliberately does not
-print every frame or gaze sample or recreate Instance 2's decision logic.
+SPACE, attempt-relative timestamps start at zero. Terminal style is controlled by
+`terminal.verbose_decisions`, which defaults to `true`. `--verbose-decisions` and
+`--concise-decisions` override that setting for one run and are mutually exclusive.
+
+Verbose mode reports Instance 2's actual transition outputs: candidate/episode
+starts, candidate switches, temporary no-match pauses and resumptions, episode-end
+reasons, dwell crossings at 25/50/75%, dwell triggers, and resulting practice
+selections. Concise mode suppresses the transition-rich lines while retaining
+lifecycle notices, selections, no-frame warnings, failures, and the final stop
+reason/artifact directory. Both modes write the same detailed structured events to
+`events.jsonl`; the setting affects terminal output only. Neither mode prints every
+frame or gaze sample or recreates Instance 2's decision logic.
 
 Artifacts are written below `runs/practice/<run-id>/`. They are deliberately outside
 the participant/session hierarchy and never include a completed-session record,

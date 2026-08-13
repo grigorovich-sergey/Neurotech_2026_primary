@@ -1,8 +1,10 @@
 import json
 from pathlib import Path
 import time
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from eeg_pipeline.contracts import EEGSample
 from foundations.config import load_resolved_config
@@ -22,6 +24,7 @@ from practice_session.runner import (
     _wait_for_start_signal,
     run_practice_session,
 )
+from scripts.run_practice_session import _apply_cli_overrides
 
 
 PRACTICE_CONFIG = PROJECT_ROOT / "configs" / "practice_session.yaml"
@@ -178,6 +181,77 @@ def test_practice_runs_live_gaze_path_without_experimental_artifacts(
     assert "CANDIDATE start: episode=1 cup (track 1)" in terminal
     assert "TRIGGER: episode=1 cup (track 1)" in terminal
     assert "stopped: duration_reached | successful=True" in terminal
+
+
+def test_concise_terminal_hides_decision_lines_but_keeps_events_and_selection(
+    tmp_path: Path, capsys
+) -> None:
+    config = _config(tmp_path)
+    config["terminal"]["verbose_decisions"] = False
+
+    run = run_practice_session(
+        config,
+        detector=FakeDetector(),
+        tracker=FakeTracker(),
+        mindlink_factory=FakeMindLink,
+        start_gate=lambda: True,
+    )
+
+    terminal = capsys.readouterr().out
+    assert "attempt started" in terminal
+    assert "SELECTION triggered: cup (track 1)" in terminal
+    assert "stopped: duration_reached | successful=True" in terminal
+    assert "CANDIDATE start:" not in terminal
+    assert "DWELL 25%:" not in terminal
+    assert "TRIGGER:" not in terminal
+    assert "EPISODE end:" not in terminal
+    event_names = [event["name"] for event in _events(run)]
+    assert "practice_candidate_started" in event_names
+    assert "practice_dwell_progress" in event_names
+    assert "practice_dwell_trigger" in event_names
+    assert "practice_episode_ended" in event_names
+    assert "practice_selection" in event_names
+    resolved = json.loads(
+        (run / "resolved_practice_config.json").read_text(encoding="utf-8")
+    )
+    assert resolved["terminal"]["verbose_decisions"] is False
+
+
+def test_terminal_style_cli_overrides_config_without_changing_eeg() -> None:
+    config = load_resolved_config(PRACTICE_CONFIG)
+    assert config["terminal"]["verbose_decisions"] is True
+    assert config["eeg"]["enabled"] is False
+
+    _apply_cli_overrides(
+        config,
+        SimpleNamespace(
+            with_eeg=False,
+            without_eeg=False,
+            verbose_decisions=False,
+            concise_decisions=True,
+        ),
+    )
+    assert config["terminal"]["verbose_decisions"] is False
+    assert config["eeg"]["enabled"] is False
+
+    _apply_cli_overrides(
+        config,
+        SimpleNamespace(
+            with_eeg=False,
+            without_eeg=False,
+            verbose_decisions=True,
+            concise_decisions=False,
+        ),
+    )
+    assert config["terminal"]["verbose_decisions"] is True
+
+
+def test_practice_rejects_non_boolean_terminal_style(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config["terminal"]["verbose_decisions"] = "yes"
+
+    with pytest.raises(ValueError, match="terminal.verbose_decisions must be a bool"):
+        run_practice_session(config)
 
 
 def test_space_gate_precedes_attempt_clock_capture_and_display(

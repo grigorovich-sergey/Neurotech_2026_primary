@@ -94,6 +94,9 @@ def _validate_config(config: dict[str, Any]) -> None:
     eeg = _mapping(config, "eeg")
     if not isinstance(eeg.get("enabled"), bool):
         raise ValueError("eeg.enabled must be a bool")
+    terminal = _mapping(config, "terminal")
+    if not isinstance(terminal.get("verbose_decisions"), bool):
+        raise ValueError("terminal.verbose_decisions must be a bool")
     recording = _mapping(config, "recording")
     for key in ("glasses_enabled", "eeg_enabled"):
         if not isinstance(recording.get(key), bool):
@@ -343,9 +346,18 @@ class _InteractionDecisionReporter:
 
     _PROGRESS_MARKS = (0.25, 0.50, 0.75)
 
-    def __init__(self, terminal: _TerminalReporter, events: _ThreadSafeEvents) -> None:
+    def __init__(
+        self,
+        terminal: _TerminalReporter,
+        events: _ThreadSafeEvents,
+        *,
+        verbose_decisions: bool = True,
+    ) -> None:
+        if not isinstance(verbose_decisions, bool):
+            raise TypeError("verbose_decisions must be a bool")
         self._terminal = terminal
         self._events = events
+        self._verbose_decisions = verbose_decisions
         self._active_episode_id: int | None = None
         self._paused_episode_id: int | None = None
         self._reported_progress: set[float] = set()
@@ -358,7 +370,8 @@ class _InteractionDecisionReporter:
         payload: dict[str, Any],
     ) -> None:
         self._events.log(timestamp, name, payload)
-        self._terminal.report(timestamp, message)
+        if self._verbose_decisions:
+            self._terminal.report(timestamp, message)
 
     def _report_episode_end(self, episode: CandidateEpisode) -> None:
         reason = episode.end_reason.value if episode.end_reason is not None else "unknown"
@@ -845,7 +858,11 @@ def run_practice_session(
 
     events = _ThreadSafeEvents(run_directory / "events.jsonl")
     terminal = _TerminalReporter()
-    decisions = _InteractionDecisionReporter(terminal, events)
+    decisions = _InteractionDecisionReporter(
+        terminal,
+        events,
+        verbose_decisions=resolved["terminal"]["verbose_decisions"],
+    )
     state = _RunState()
     diagnostics = _Diagnostics()
     processing = resolved["processing"]
