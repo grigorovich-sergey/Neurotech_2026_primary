@@ -5,7 +5,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from eeg_pipeline.contracts import EEGFeatureWindow, QualityState, WindowCompleteness
+from eeg_pipeline.contracts import (
+    EEGFeatureWindow,
+    EEGSample,
+    QualityState,
+    WindowCompleteness,
+)
 from eeg_pipeline.processing import FEATURE_NAMES as EEG_FEATURE_NAMES
 from foundations.config import load_resolved_config
 from gaze_interaction.contracts import BoundingBox
@@ -27,6 +32,7 @@ from experiment_learning.eeg_indicator import (
     InvalidEEGIndicator,
     engagement_index,
 )
+from experiment_learning.guardian_source import GuardianEEGFeatureSource
 from experiment_learning.policy import (
     FrozenSessionPolicy,
     create_cold_start_policy,
@@ -72,6 +78,43 @@ class _EEGSource:
             feature_names=EEG_FEATURE_NAMES,
             values=self.values if usable else None,
         )
+
+
+class _GuardianQueue:
+    def __init__(self, samples: list[EEGSample]) -> None:
+        self.samples = samples
+        self.cutoffs: list[float | None] = []
+
+    def drain(self, *, cutoff_timestamp=None) -> tuple[EEGSample, ...]:
+        self.cutoffs.append(cutoff_timestamp)
+        ready = tuple(
+            sample
+            for sample in self.samples
+            if cutoff_timestamp is None or sample.timestamp <= cutoff_timestamp
+        )
+        self.samples = [sample for sample in self.samples if sample not in ready]
+        return ready
+
+
+class _FeaturePipeline:
+    def __init__(self) -> None:
+        self.samples: list[EEGSample] = []
+        self.calls: list[tuple[float, float]] = []
+
+    def add_sample(self, sample: EEGSample) -> None:
+        self.samples.append(sample)
+
+    def features(self, start: float, end: float) -> EEGFeatureWindow:
+        self.calls.append((start, end))
+        return _EEGSource().features(start, end)
+
+
+class _Recorder:
+    def __init__(self) -> None:
+        self.samples: list[EEGSample] = []
+
+    def record(self, sample: EEGSample) -> None:
+        self.samples.append(sample)
 
 
 def _policy(*, reduction: float = 0.0, coefficient: float = 0.0) -> FrozenSessionPolicy:
@@ -226,6 +269,80 @@ def test_schedule_names_active_condition_in_value_error(tmp_path: Path) -> None:
         match="active_condition must be G or E on CSV line 2",
     ):
         load_condition_schedule(path)
+
+
+def test_guardian_feature_source_drains_closed_cutoffs_and_records_on_caller() -> None:
+    queued = _GuardianQueue(
+        [
+            EEGSample(1.5, 1.0),
+            EEGSample(2.0, 2.0),
+            EEGSample(2.25, 3.0),
+        ]
+    )
+    pipeline = _FeaturePipeline()
+    recorder = _Recorder()
+    source = GuardianEEGFeatureSource(
+        guardian=queued,
+        pipeline=pipeline,
+        recorder=recorder,
+    )
+
+    assert source.drain_through(1.75) == 1
+    window = source.features(1.0, 2.0)
+
+    assert queued.cutoffs == [1.75, 2.0]
+    assert [sample.timestamp for sample in pipeline.samples] == [1.5, 2.0]
+    assert recorder.samples == pipeline.samples
+    assert pipeline.calls == [(1.0, 2.0)]
+    assert window.requested_end == 2.0
+    assert source.ingested_sample_count == 2
+    assert source.last_ingested_timestamp == 2.0
+    assert [sample.timestamp for sample in queued.samples] == [2.25]
+
+    assert source.drain_remaining() == 1
+    assert [sample.timestamp for sample in pipeline.samples] == [1.5, 2.0, 2.25]
+
+
+def test_guardian_feature_source_rejects_future_sample_without_ingesting() -> None:
+    class _ViolatingGuardian:
+        def drain(self, *, cutoff_timestamp=None) -> tuple[EEGSample, ...]:
+            assert cutoff_timestamp == 2.0
+            return (EEGSample(2.001, 1.0),)
+
+    pipeline = _FeaturePipeline()
+    recorder = _Recorder()
+    source = GuardianEEGFeatureSource(
+        guardian=_ViolatingGuardian(),
+        pipeline=pipeline,
+        recorder=recorder,
+    )
+
+    with pytest.raises(RuntimeError, match="after its closed cutoff"):
+        source.features(1.0, 2.0)
+
+    assert pipeline.samples == []
+    assert recorder.samples == []
+    assert pipeline.calls == []
+
+
+def test_controller_prediction_drains_guardian_only_through_its_cutoff() -> None:
+    queued = _GuardianQueue(
+        [
+            EEGSample(2.2, 1.0),
+            EEGSample(2.25, 2.0),
+            EEGSample(2.3, 3.0),
+        ]
+    )
+    pipeline = _FeaturePipeline()
+    source = GuardianEEGFeatureSource(guardian=queued, pipeline=pipeline)
+    controller = _controller(condition=Condition.E)
+
+    decision = _evaluate(controller, source)
+
+    assert decision.newly_frozen is True
+    assert queued.cutoffs == [2.25]
+    assert [sample.timestamp for sample in pipeline.samples] == [2.2, 2.25]
+    assert [sample.timestamp for sample in queued.samples] == [2.3]
 
 
 def test_eeg_decision_uses_only_scalar_index_and_freezes_without_runtime_mutation() -> None:
