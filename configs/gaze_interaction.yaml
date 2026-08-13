@@ -17,7 +17,7 @@ source:
 
 detector:
   model: yoloe-26n-seg-pf.pt
-  confidence_threshold: 0.45
+  confidence_threshold: 0.3
   image_size: 640
   device: cpu
   category_filter:
@@ -33,6 +33,10 @@ detector:
         terms: [ipad, tablet, tablet computer]
       - name: wall poster
         terms: [wall poster, poster, placard]
+      - name: TV
+        terms: [TV, television, TV screen]
+      - name: mug
+        terms: [mug, coffe cup, cup, teacup]
 
 tracker:
   activation_threshold: 0.25
