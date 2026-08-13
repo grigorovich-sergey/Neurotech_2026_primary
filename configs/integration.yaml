@@ -2,12 +2,12 @@ output_root: runs
 
 participant:
   id: integrated-P001
-  sequence_index: 0
-  checkpoint_path: runs/participants/integrated-P001.pkl
-  resume_checkpoint: true
+  sequence_id: g-first
+  artifact_directory: runs/participants/integrated-P001
 
 session:
   id_prefix: integrated-session
+  maximum_duration_seconds: 12.0
 
 input:
   mode: synthetic

@@ -42,20 +42,21 @@ Scientific timestamps are float seconds relative to experiment/source start.
 The UTC run-directory name is only an output identifier and is not the
 scientific timebase.
 
-## Integrated pre-hardware experiment — temporarily unavailable
+## Integrated experiment
 
-The checked-in integrated runner still targets the superseded online-learning API
-and currently fails during import. Do not use it for experiments until the
-schedule/frozen-policy/session integration rewrite is complete. The command below
-is retained only to identify the affected entry point:
+Run the hardware-free deterministic path with virtual glasses, synthetic EEG,
+the frozen session policy, scheduled feedback, immutable session artifacts, and
+between-session training:
 
 ```bash
 python scripts/run_integrated_experiment.py
 ```
 
-The existing [Instance 5 integration document](docs/instance_5_integration.md)
-describes that obsolete implementation and is not a current experimental runbook.
-Subsystem runners and the live hardware practice mode below remain available.
+The runner also supports replay, prerecorded-video/YOLOE input, and live Guardian
+EEG. Live Guardian mode performs battery/impedance preflight with raw EEG off,
+waits for `SPACE`, then starts the shared attempt clock before acquisition. See
+[docs/instance_5_integration.md](docs/instance_5_integration.md) for configuration,
+artifact lineage, cleanup guarantees, and retry behavior.
 
 ## Live hardware practice
 

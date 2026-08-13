@@ -3,7 +3,6 @@
 from collections import Counter
 import csv
 import json
-import math
 from pathlib import Path
 from statistics import mean, median
 from typing import Any
@@ -13,12 +12,26 @@ def _ratio(numerator: int, denominator: int) -> float | None:
     return None if denominator == 0 else numerator / denominator
 
 
-def _model_metrics(results: list[dict[str, Any]], prefix: str) -> dict[str, Any]:
-    predicted_key = f"{prefix}_predicted_label"
-    tp = sum(row[predicted_key] == 1 and row["common_label"] == 1 for row in results)
-    fp = sum(row[predicted_key] == 1 and row["common_label"] == 0 for row in results)
-    tn = sum(row[predicted_key] == 0 and row["common_label"] == 0 for row in results)
-    fn = sum(row[predicted_key] == 0 and row["common_label"] == 1 for row in results)
+def _prediction(record: dict[str, Any], prefix: str) -> int | None:
+    status = record[f"{prefix}_outcome"]["status"]
+    if status == "action":
+        return 1
+    if status == "no_action":
+        return 0
+    return None
+
+
+def _model_metrics(records: list[dict[str, Any]], prefix: str) -> dict[str, Any]:
+    scored = [
+        (prediction, int(record["common_label"]))
+        for record in records
+        if record.get("common_label") in (0, 1)
+        and (prediction := _prediction(record, prefix)) is not None
+    ]
+    tp = sum(prediction == 1 and label == 1 for prediction, label in scored)
+    fp = sum(prediction == 1 and label == 0 for prediction, label in scored)
+    tn = sum(prediction == 0 and label == 0 for prediction, label in scored)
+    fn = sum(prediction == 0 and label == 1 for prediction, label in scored)
     precision = _ratio(tp, tp + fp)
     recall = _ratio(tp, tp + fn)
     f1 = (
@@ -27,6 +40,7 @@ def _model_metrics(results: list[dict[str, Any]], prefix: str) -> dict[str, Any]
         else 2 * precision * recall / (precision + recall)
     )
     return {
+        "scored": len(scored),
         "true_positive": tp,
         "false_positive": fp,
         "true_negative": tn,
@@ -34,7 +48,7 @@ def _model_metrics(results: list[dict[str, Any]], prefix: str) -> dict[str, Any]
         "precision": precision,
         "recall": recall,
         "f1": f1,
-        "accuracy": _ratio(tp + tn, len(results)),
+        "accuracy": _ratio(tp + tn, len(scored)),
         "false_activations": fp,
         "missed_intentions": fn,
     }
@@ -68,23 +82,28 @@ def _load_events(path: Path) -> list[dict[str, Any]]:
     return events
 
 
-def _learning_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _eligible(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [record for record in records if record.get("training_eligible") is True]
+
+
+def _learning_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    cumulative_results: list[dict[str, Any]] = []
-    for index, result in enumerate(results, start=1):
-        cumulative_results.append(result)
-        g_metrics = _model_metrics(cumulative_results, "g")
-        e_metrics = _model_metrics(cumulative_results, "e")
+    cumulative: list[dict[str, Any]] = []
+    for index, record in enumerate(_eligible(records), start=1):
+        cumulative.append(record)
+        g_metrics = _model_metrics(cumulative, "g")
+        e_metrics = _model_metrics(cumulative, "e")
         rows.append(
             {
                 "sample_index": index,
-                "participant_id": result["participant_id"],
-                "session_id": result["session_id"],
-                "episode_id": result["episode_id"],
-                "active_condition": result["active_condition"],
-                "common_label": result["common_label"],
-                "g_correct": int(result["g_correct"]),
-                "e_correct": int(result["e_correct"]),
+                "participant_id": record["participant_id"],
+                "session_id": record["session_id"],
+                "session_number": record["session_number"],
+                "episode_id": record["episode_id"],
+                "active_condition": record["active_condition"],
+                "common_label": record["common_label"],
+                "g_outcome": record["g_outcome"]["status"],
+                "e_outcome": record["e_outcome"]["status"],
                 "g_cumulative_accuracy": g_metrics["accuracy"],
                 "e_cumulative_accuracy": e_metrics["accuracy"],
                 "g_cumulative_f1": g_metrics["f1"],
@@ -103,104 +122,85 @@ def generate_analysis(events_path: str | Path, output_directory: str | Path) -> 
     destination = Path(output_directory)
     destination.mkdir(parents=True, exist_ok=True)
     events = _load_events(source)
-    predictions = [
-        event["payload"] for event in events if event.get("name") == "experiment_prediction"
+    decisions = [
+        event["payload"] for event in events if event.get("name") == "experiment_policy_decision"
     ]
-    results = [
-        event["payload"] for event in events if event.get("name") == "experiment_episode_result"
+    records = [
+        event["payload"]
+        for event in events
+        if event.get("name") == "experiment_episode_training_record"
     ]
-    if any(result.get("update_applied") is not True for result in results):
-        raise ValueError("persisted episode result reports an unapplied paired update")
-
-    episode_starts: dict[tuple[str, int], float] = {}
-    for event in events:
-        if event.get("name") != "integration_episode_started":
-            continue
-        payload = event["payload"]
-        key = (str(payload["session_id"]), int(payload["episode_id"]))
-        episode_starts[key] = float(payload["start_timestamp"])
-
-    selection_latencies: list[float] = []
-    for result in results:
-        if not result["action_occurred"]:
-            continue
-        key = (str(result["session_id"]), int(result["episode_id"]))
-        start = episode_starts.get(key)
-        if start is None:
-            continue
-        latency = float(result["outcome_timestamp"]) - start
-        if latency < -1e-12 or not math.isfinite(latency):
-            raise ValueError("persisted selection latency is invalid")
-        selection_latencies.append(max(0.0, latency))
-
-    unavailable = [record for record in predictions if record.get("unavailable_reason")]
-    skip_reasons = Counter(str(record["unavailable_reason"]) for record in unavailable)
-    label_counts = Counter(str(result["common_label"]) for result in results)
-    action_counts = Counter("action" if result["action_occurred"] else "no_action" for result in results)
-    controlled = [result for result in results if result.get("instructed_intention") is not None]
-    controlled_matches = sum(
-        result["common_label"] == result["instructed_intention"] for result in controlled
+    usable = _eligible(records)
+    exclusions = Counter(
+        reason
+        for record in records
+        if not record.get("training_eligible")
+        for reason in record.get("exclusion_reasons", [])
     )
-
+    label_counts = Counter(str(record["common_label"]) for record in usable)
+    action_counts = Counter(
+        "action" if record["action_occurred"] else "no_action"
+        for record in usable
+    )
+    latencies = [
+        float(record["action_timestamp"]) - float(record["episode_start_timestamp"])
+        for record in usable
+        if record.get("action_timestamp") is not None
+    ]
     by_condition: dict[str, Any] = {}
-    for condition in sorted({str(result["active_condition"]) for result in results}):
-        subset = [result for result in results if result["active_condition"] == condition]
+    for condition in sorted({str(record["active_condition"]) for record in records}):
+        subset = [record for record in records if record["active_condition"] == condition]
         by_condition[condition] = {
-            "episode_results": len(subset),
-            "G": _model_metrics(subset, "g"),
-            "E": _model_metrics(subset, "e"),
+            "episode_records": len(subset),
+            "training_eligible": len(_eligible(subset)),
+            "G": _model_metrics(_eligible(subset), "g"),
+            "E": _model_metrics(_eligible(subset), "e"),
         }
 
     summary = {
-        "episode_results": len(results),
-        "paired_predictions_available": len(predictions) - len(unavailable),
-        "paired_skips": {
-            "count": len(unavailable),
-            "reasons": dict(sorted(skip_reasons.items())),
+        "episode_records": len(records),
+        "training_eligible_records": len(usable),
+        "policy_decisions": len(decisions),
+        "excluded_records": {
+            "count": len(records) - len(usable),
+            "reasons": dict(sorted(exclusions.items())),
         },
-        "active_conditions": sorted({str(result["active_condition"]) for result in results}),
+        "active_conditions": sorted({str(record["active_condition"]) for record in records}),
         "common_feedback_labels": dict(sorted(label_counts.items())),
         "outcomes": dict(sorted(action_counts.items())),
         "models": {
-            "G": _model_metrics(results, "g"),
-            "E": _model_metrics(results, "e"),
+            "G": _model_metrics(usable, "g"),
+            "E": _model_metrics(usable, "e"),
         },
         "by_active_condition": by_condition,
-        "selection_latency_seconds": _latency_summary(selection_latencies),
-        "controlled_intention_agreement": {
-            "trials": len(controlled),
-            "matches": controlled_matches,
-            "fraction": _ratio(controlled_matches, len(controlled)),
-        },
+        "selection_latency_seconds": _latency_summary(latencies),
         "scientific_note": (
             "common_label is feedback-derived; feedback silence is not independently observed ground truth"
         ),
     }
-    summary_path = destination / "analysis_summary.json"
-    with summary_path.open("w", encoding="utf-8") as handle:
+    with (destination / "analysis_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True, allow_nan=False)
         handle.write("\n")
 
-    learning_path = destination / "learning_curve.csv"
-    rows = _learning_rows(results)
     columns = (
         "sample_index",
         "participant_id",
         "session_id",
+        "session_number",
         "episode_id",
         "active_condition",
         "common_label",
-        "g_correct",
-        "e_correct",
+        "g_outcome",
+        "e_outcome",
         "g_cumulative_accuracy",
         "e_cumulative_accuracy",
         "g_cumulative_f1",
         "e_cumulative_f1",
     )
-    with learning_path.open("w", encoding="utf-8", newline="") as handle:
+    with (destination / "learning_curve.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(_learning_rows(records))
     return summary
 
 

@@ -405,25 +405,19 @@ It saves resolved configuration, schedule-bound policies, completed-session
 artifacts, training reports, scientific JSONL events, and a deterministic summary.
 The synthetic seed controls only generated data; the trainer itself is seedless.
 
-## Required Instance 5 correction
+## Instance 5 integration status
 
-Merged Instance 5 still imports the removed `ParticipantState`, `ModelConfig`,
-pickle checkpoint, parity schedule, and online-learning controller calls. It must be
-updated before the integrated runner can use this corrected subsystem. Specifically:
+Instance 5 now implements this contract. It uses schedule-bound immutable JSON
+policies and completed sessions, constructs dwell parameters from the active
+condition, calls `evaluate_update`, routes explicit action/no-action/feedback
+operations, applies typed cancellations, and trains only after successful closure.
 
-- replace checkpoint allocation/resume with schedule + frozen-policy attempt binding;
-- construct dwell parameters from the active condition's frozen policy;
-- replace `consider_prediction` with `evaluate_update`;
-- prepare/start the persistent Guardian around SPACE and pass
-  `GuardianEEGFeatureSource` so every live EEG window drains through its exact
-  cutoff on the Integration thread;
-- periodically call `drain_through(latest_processed_timestamp)` to prevent bounded
-  queue buildup, then stop, final-drain, and close in independent cleanup blocks;
-- replace `on_dwell_trigger`/`on_episode_end`/`button_press` with the explicit
-  action/no-action/feedback operations documented above;
-- pass `action_gate_open` to Instance 2 and apply cancellation instructions;
-- persist `CompletedSession` only on successful closure and invoke the trainer once;
-- remove training-count assertions and analyze the new episode/session/report schemas.
+Live attempts use the persistent Guardian lifecycle and
+`GuardianEEGFeatureSource`: preflight precedes SPACE, the attempt clock starts
+before raw EEG, every feature request drains through its exact cutoff on the
+Integration thread, and stop/final-drain/close remain independent cleanup steps.
+The current runbook and failure semantics are documented in
+`docs/instance_5_integration.md`.
 
-Instances 1–3 require no changes. `river==0.22.0` has been removed; existing NumPy
-and SciPy dependencies cover the corrected implementation.
+Instances 1–3 require no algorithm changes. `river==0.22.0` remains removed;
+existing NumPy and SciPy dependencies cover the corrected implementation.
