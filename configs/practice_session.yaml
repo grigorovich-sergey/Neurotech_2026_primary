@@ -5,7 +5,7 @@ eeg:
   enabled: false
 
 terminal:
-  verbose_decisions: true
+  verbose_decisions: false
 
 recording:
   glasses_enabled: false
