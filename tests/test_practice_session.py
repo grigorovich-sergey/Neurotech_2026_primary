@@ -1,12 +1,12 @@
 import json
 from pathlib import Path
-import time
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from eeg_pipeline.contracts import EEGSample
+from eeg_pipeline.guardian import GuardianPreflight
 from foundations.config import load_resolved_config
 from foundations.contracts import GazeSample, SceneFrame
 from foundations.timebase import MonotonicClock
@@ -111,6 +111,7 @@ dwell:
     config["output_root"] = str(tmp_path / "runs")
     config["maximum_duration_seconds"] = 0.05
     config["eeg"]["enabled"] = eeg_enabled
+    config["terminal"]["verbose_decisions"] = True
     config["display"]["enabled"] = False
     config["subsystem_config_overrides"]["gaze_interaction"] = str(gaze_override)
     return config
@@ -219,7 +220,7 @@ def test_concise_terminal_hides_decision_lines_but_keeps_events_and_selection(
 
 def test_terminal_style_cli_overrides_config_without_changing_eeg() -> None:
     config = load_resolved_config(PRACTICE_CONFIG)
-    assert config["terminal"]["verbose_decisions"] is True
+    assert config["terminal"]["verbose_decisions"] is False
     assert config["eeg"]["enabled"] is False
 
     _apply_cli_overrides(
@@ -314,11 +315,12 @@ def test_space_gate_precedes_attempt_clock_capture_and_display(
 
 
 def test_prestart_abort_never_starts_clock_capture_display_or_eeg(
-    tmp_path: Path, capsys
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     instances: list[FakeMindLink] = []
     clock_constructions: list[str] = []
     guardian_constructions: list[str] = []
+    guardian_lifecycle: list[str] = []
     config = _config(tmp_path, eeg_enabled=True)
     config["recording"]["glasses_enabled"] = True
 
@@ -331,10 +333,19 @@ def test_prestart_abort_never_starts_clock_capture_display_or_eeg(
         clock_constructions.append("clock")
         return MonotonicClock()
 
+    class FakeGuardianPreflight:
+        def prepare(self, **_: object) -> GuardianPreflight:
+            guardian_lifecycle.append("prepare")
+            return GuardianPreflight(90.0, 10_000.0)
+
+        def close(self) -> None:
+            guardian_lifecycle.append("close")
+
     def guardian_factory(**_: object) -> object:
         guardian_constructions.append("guardian")
-        return object()
+        return FakeGuardianPreflight()
 
+    monkeypatch.setenv("IDUN_API_TOKEN", "test-token")
     run = run_practice_session(
         config,
         detector=FakeDetector(),
@@ -347,7 +358,8 @@ def test_prestart_abort_never_starts_clock_capture_display_or_eeg(
 
     assert instances[0].log == ["connect", "calibrate", "close"]
     assert clock_constructions == []
-    assert guardian_constructions == []
+    assert guardian_constructions == ["guardian"]
+    assert guardian_lifecycle == ["prepare", "close"]
     assert not (run / "practice_glasses.h5").exists()
     assert not (run / "practice_eeg.h5").exists()
     assert not (run / "mindlink_frame_metadata.jsonl").exists()
@@ -358,13 +370,17 @@ def test_prestart_abort_never_starts_clock_capture_display_or_eeg(
     assert summary["capture_started_timestamp"] is None
     assert summary["attempt_duration_seconds"] is None
     assert summary["capture_duration_seconds"] is None
+    assert summary["eeg_prepared"] is True
     assert summary["eeg_started"] is False
     event_names = [event["name"] for event in _events(run)]
     assert "practice_setup_aborted" in event_names
     assert "practice_run_started" not in event_names
     assert "practice_capture_started" not in event_names
     terminal = capsys.readouterr().out
-    assert "[practice setup] calibration complete; acquisition is OFF" in terminal
+    assert (
+        "[practice setup] calibration complete; MindLink acquisition is OFF" in terminal
+    )
+    assert "[practice setup] Guardian ready; raw EEG is OFF" in terminal
     assert "[practice setup] aborted before acquisition start" in terminal
 
 
@@ -524,6 +540,7 @@ def test_optional_eeg_uses_shared_clock_and_stops_with_practice(
 ) -> None:
     mindlink_clocks = []
     guardian_clocks = []
+    guardian_lifecycle: list[str] = []
 
     def mindlink_factory(**kwargs) -> FakeMindLink:
         mindlink_clocks.append(kwargs["clock"])
@@ -531,16 +548,52 @@ def test_optional_eeg_uses_shared_clock_and_stops_with_practice(
 
     class FakeGuardian:
         def __init__(self, *, clock, **_: object) -> None:
+            guardian_lifecycle.append("construct")
             self.clock = clock
             guardian_clocks.append(clock)
+            self.samples: list[EEGSample] = []
+            self.recording_done = False
+            self.recording_id = None
+            self.queue_overflowed = False
 
-        def run(self, *, on_sample, stop_requested, **_: object) -> float:
+        def prepare(self, **_: object) -> GuardianPreflight:
+            guardian_lifecycle.append("prepare")
+            return GuardianPreflight(88.0, 12_000.0)
+
+        def start(self, *, recording_seconds: int) -> None:
+            guardian_lifecycle.append("start")
+            assert recording_seconds > 0
             start = self.clock()
             for index in range(20):
-                on_sample(EEGSample(start + index * 0.004, float(index)))
-            while not stop_requested():
-                time.sleep(0.001)
-            return 12_000.0
+                timestamp = start + index * 0.004
+                self.samples.append(
+                    EEGSample(
+                        timestamp,
+                        float(index),
+                        host_receipt_timestamp=timestamp + 0.01,
+                    )
+                )
+
+        def drain(self, *, cutoff_timestamp=None) -> tuple[EEGSample, ...]:
+            ready = []
+            while self.samples and (
+                cutoff_timestamp is None
+                or self.samples[0].timestamp <= cutoff_timestamp
+            ):
+                ready.append(self.samples.pop(0))
+            return tuple(ready)
+
+        def stop(self) -> None:
+            guardian_lifecycle.append("stop")
+            self.recording_done = True
+            self.recording_id = "practice-recording"
+
+        def close(self) -> None:
+            guardian_lifecycle.append("close")
+
+    def start_gate() -> bool:
+        assert guardian_lifecycle == ["construct", "prepare"]
+        return True
 
     monkeypatch.setenv("IDUN_API_TOKEN", "test-token")
     run = run_practice_session(
@@ -549,13 +602,22 @@ def test_optional_eeg_uses_shared_clock_and_stops_with_practice(
         tracker=FakeTracker(),
         mindlink_factory=mindlink_factory,
         guardian_factory=FakeGuardian,
-        start_gate=lambda: True,
+        start_gate=start_gate,
     )
 
     assert mindlink_clocks[0].__self__ is guardian_clocks[0].__self__
+    assert guardian_lifecycle == ["construct", "prepare", "start", "stop", "close"]
     summary = json.loads((run / "practice_summary.json").read_text(encoding="utf-8"))
     assert summary["successful"] is True
+    assert summary["eeg_prepared"] is True
     assert summary["eeg_started"] is True
     assert summary["eeg"]["sample_count"] == 20
+    assert summary["eeg"]["battery_percent"] == 88.0
     assert summary["eeg"]["impedance_ohms"] == 12_000.0
+    assert summary["eeg"]["recording_id"] == "practice-recording"
+    assert summary["eeg"]["gap_count"] == 0
+    assert summary["eeg"]["mean_receipt_lag_seconds"] == pytest.approx(0.01)
     assert (run / "practice_eeg.h5").is_file()
+    for artifact in run.iterdir():
+        if artifact.suffix in {".json", ".jsonl"}:
+            assert "test-token" not in artifact.read_text(encoding="utf-8")

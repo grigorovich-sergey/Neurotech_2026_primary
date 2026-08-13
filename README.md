@@ -69,12 +69,13 @@ python scripts/run_practice_session.py --concise-decisions
 ```
 
 Guardian EEG is optional and monitor-only; it never changes practice dwell.
-Complete calibration first, then press `SPACE` in the terminal to create a fresh
-video receiver and start the attempt clock, gaze/video streams, display, and
-optional EEG. Nothing is acquired during the post-calibration wait. Press `Q` or
-`Esc` to stop after starting. Verbose decision reporting is the default;
-`--concise-decisions` retains lifecycle, selection, warning, error, and stop output
-while suppressing candidate/dwell transition lines. See
+For Guardian, place the single-line API token in the Git-ignored
+`.secrets/idun_api_token` file or set `IDUN_API_TOKEN`. Complete MindLink
+calibration and Guardian battery/impedance preflight first, then press `SPACE` to
+create a fresh video receiver and start the shared attempt clock, gaze/video
+streams, display, and raw EEG. Nothing is recorded during the post-calibration
+wait. Press `Q` or `Esc` to stop after starting. Concise decision reporting is the
+default; `--verbose-decisions` adds candidate/dwell transition lines. See
 [docs/practice_session.md](docs/practice_session.md) for setup, displayed
 diagnostics, artifacts, and current hardware-validation limitations.
 

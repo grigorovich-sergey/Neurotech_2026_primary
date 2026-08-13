@@ -13,13 +13,17 @@ configured gaze-interaction override when pilot observations expose different
 YOLOE wording.
 
 Before launch, start the AdHawk Backend Service and use the same vendor SDK setup
-as the MindLink smoke runner. For EEG, install the Guardian extra and export the
-configured token variable (default `IDUN_API_TOKEN`):
+as the MindLink smoke runner. For EEG, install the Guardian extra and create the
+repository-root token file `.secrets/idun_api_token` containing only the token:
 
 ```text
 python -m pip install -e ".[guardian]"
-export IDUN_API_TOKEN=...
 ```
+
+`/.secrets/` is ignored by Git. On POSIX, use mode `0600` for the token file; the
+loader rejects broader permissions. The `IDUN_API_TOKEN` environment variable is
+still supported and takes precedence over the file. Neither source is copied into
+resolved configuration or diagnostics.
 
 ```text
 python scripts/run_practice_session.py
@@ -34,15 +38,17 @@ The launch lifecycle is intentionally strict:
 ```text
 connect tracker
 -> calibrate fully
--> wait with acquisition OFF
+-> connect Guardian, check battery, and pass impedance preflight with raw EEG OFF
+-> wait with video/gaze/raw EEG acquisition OFF
 -> press SPACE
--> start the attempt clock, Guardian (if enabled), display, and fresh MindLink capture
+-> start the attempt clock, Guardian raw EEG, display, and fresh MindLink capture
 ```
 
 The SPACE gate reads one console key; Enter is not required. `Q`, `Esc`, or Ctrl-C
 at the gate aborts cleanly without creating a video receiver, enabling gaze streams,
-starting Guardian, opening the video display, or starting the attempt clock. Sensor
-recording files are also created only after SPACE.
+starting Guardian raw EEG, opening the video display, or starting the attempt clock.
+The prepared Guardian connection is closed, and sensor recording files are created
+only after SPACE.
 
 `MindLinkAdapter.start_capture()` is deliberately called only after the gate. It
 creates a new `VideoReceiver` at that point; no receiver or video transport is
@@ -52,8 +58,10 @@ frame callbacks when a receiver survived calibration and a post-calibration paus
 
 After acquisition starts, press `Q` or `Esc` in the display to stop. The same
 integration-owned attempt clock, whose zero is the SPACE signal, is passed to
-MindLink and Guardian. Guardian shutdown is cooperative: the practice stop signal
-cancels and awaits the SDK recording task so its cleanup can finish.
+MindLink and Guardian. Practice drains Guardian's bounded queue and writes the EEG
+pipeline/HDF5 on the practice thread. Shutdown cancels and awaits the SDK recording
+task, drains remaining samples, captures the cloud recording ID, and disconnects on
+the SDK owner loop.
 
 The display includes recognized objects, a high-contrast labelled gaze bullseye,
 current gaze validity/coordinates, current candidate, fixed dwell,
@@ -65,7 +73,7 @@ processed-scene rate on the target computer.
 
 Before SPACE, terminal notices use the explicit `[practice setup]` prefix. After
 SPACE, attempt-relative timestamps start at zero. Terminal style is controlled by
-`terminal.verbose_decisions`, which defaults to `true`. `--verbose-decisions` and
+`terminal.verbose_decisions`, which defaults to `false`. `--verbose-decisions` and
 `--concise-decisions` override that setting for one run and are mutually exclusive.
 
 Verbose mode reports Instance 2's actual transition outputs: candidate/episode
@@ -85,7 +93,9 @@ EEG and MindLink timing metadata are retained by default when their sources are 
 Each run also writes `environment_manifest.json` with the Python/platform details and
 installed versions (or explicit unavailability) for OpenCV, Ultralytics, Supervision,
 AdHawk, and the Guardian SDK. `practice_summary.json` persists received and processed
-scene rates separately and labels the tracker-rate setting as provisional.
+scene rates separately, labels the tracker-rate setting as provisional, and records
+Guardian battery, impedance, cloud recording ID, sample rate, sample-gap count/largest
+gap, mean/maximum callback receipt lag, and queue-overflow state. Tokens are excluded.
 
 Live Guardian cancellation and combined MindLink/Guardian timing still require pilot
 validation on the experiment computer. The practice maximum duration is a safety cap,

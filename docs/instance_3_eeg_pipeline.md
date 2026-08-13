@@ -90,30 +90,63 @@ Live acquisition is an optional dependency:
 python -m pip install -e ".[guardian]"
 ```
 
-The adapter uses `idun-guardian-sdk==0.1.23` directly (no LSL), subscribes to
-`raw_eeg`, and maps each documented Guardian Unix timestamp onto an injected host
-clock using one paired anchor:
+The API token is resolved in this order:
+
+1. the configured environment variable (`IDUN_API_TOKEN` by default);
+2. the configured ignored file (`.secrets/idun_api_token` by default).
+
+The file must contain exactly one non-empty line. `/.secrets/` is ignored by Git,
+and POSIX token files with any group/other permissions are rejected. The token is
+passed only to the SDK client; it is never written to resolved configuration,
+events, summaries, or terminal output.
+
+The adapter uses `idun-guardian-sdk==0.1.23` directly (no LSL). One persistent
+worker thread and asyncio loop own the SDK client from Bluetooth connection through
+disconnect. The explicit lifecycle is:
+
+```python
+adapter = GuardianAdapter(clock=attempt_clock.now, ...)
+preflight = adapter.prepare(...)
+# Start the shared attempt clock first.
+adapter.start(recording_seconds=...)
+samples = adapter.drain(cutoff_timestamp=cutoff)
+adapter.stop()
+remaining = adapter.drain()
+adapter.close()
+```
+
+`prepare()` connects and reads battery plus the optional impedance hard gate but
+does not subscribe to or record raw EEG. `start()` subscribes to `raw_eeg` and
+captures a paired clock anchor only after the integration-owned attempt clock has
+started:
 
 ```text
 run_timestamp = anchor_run + guardian_unix_timestamp - anchor_unix
 ```
 
-`GuardianAdapter(clock=clock.now, ...)` captures the anchor after impedance
-preflight and before recording. One host receipt timestamp is captured per SDK
-callback and attached to all raw samples in that callback. The standalone runner
-creates its own monotonic clock at that point. Integrated live operation must
-instead create one `foundations.timebase.MonotonicClock` at attempt start and pass
-that same clock's `now` callable to the Guardian adapter. Vendor timestamps remain
-the source of sensor sample time; callback order is not substituted for them.
-Backward or negative mapped timestamps remain hard errors.
+One host receipt timestamp is captured per SDK callback and attached to all raw
+samples in that callback. The standalone runner creates its own monotonic clock at
+recording start. Integrated live operation must instead pass the same deferred
+attempt-clock callable used by the other hardware adapters. Vendor timestamps
+remain the source of sensor sample time; callback order is not substituted for
+them. Backward or negative mapped timestamps remain hard errors.
 
 The default preflight uses the SDK impedance stream and requires the latest
-reading to be below the configured 300 kOhm threshold before recording. Realtime
-IDUN Quality Score predictions are not required. Live Guardian acquisition has
-not been hardware-verified in the implementation environment.
+reading to be below the configured 300 kOhm threshold before recording. Battery is
+recorded as a diagnostic, not treated as a configurable scientific threshold.
+Realtime IDUN Quality Score predictions are not required.
 
-Callers that need operator-controlled shutdown may pass
-`stop_requested=stop_event.is_set` to `GuardianAdapter.run(...)`. The adapter
-polls that callback during impedance preflight and recording. A stop during
-recording cancels and awaits the SDK recording coroutine so its own cleanup can
-finish; omitting the callback preserves the original duration-based behavior.
+SDK callbacks append canonical `EEGSample` values to a bounded handoff queue.
+`drain(cutoff_timestamp=t)` returns only samples at or before the closed cutoff and
+leaves later samples queued. Instance 4 must drain immediately before each
+EEG-dependent prediction and ingest those samples into `EEGPipeline` on the
+integration thread. The SDK worker never writes HDF5 or mutates the pipeline.
+Queue overflow raises `GuardianQueueOverflowError` and stops acquisition instead
+of silently dropping scientifically relevant samples. The default capacity is
+15,000 samples (60 seconds at 250 Hz).
+
+`stop()` cancels and awaits the SDK recording task, captures its cloud recording
+ID when available, and `close()` disconnects on the same SDK loop. The blocking
+`run()` method remains as a standalone compatibility wrapper. Live Guardian
+cancellation, timestamp units, and combined MindLink/Guardian timing still require
+pilot validation with physical hardware.
