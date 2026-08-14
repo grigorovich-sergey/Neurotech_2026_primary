@@ -430,9 +430,11 @@ operations, applies typed cancellations, and trains only after successful closur
 Live attempts use the persistent Guardian lifecycle and
 `GuardianEEGFeatureSource`: fitting impedance precedes SPACE, the attempt clock
 starts before raw EEG, and every feature request evaluates a mutable ordered
-snapshot on the Integration thread. Instance 5 still needs its separately scoped
-orchestration update for gaze calibration -> live impedance -> SPACE -> recording;
-the experiment controller and predict-score-update order are unchanged.
+snapshot on the Integration thread. Instance 5's live UI now uses continuous
+impedance rather than `prepare()`; the hardware practice path demonstrates gaze
+calibration -> live impedance -> SPACE -> recording. Adding MindLink as an
+experimental Integration input remains separately scoped. The experiment
+controller and predict-score-update order are unchanged.
 
 Instances 1–3 require no algorithm changes. `river==0.22.0` remains removed;
 existing NumPy and SciPy dependencies cover the corrected implementation.

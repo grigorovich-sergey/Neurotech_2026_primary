@@ -22,6 +22,8 @@ source:
     queue_capacity_samples: 15000
     impedance:
       enabled: true
+      # Used only by the finite prepare()/standalone compatibility workflow.
+      # Live Integration/practice fitting continues until the operator gate.
       duration_seconds: 2.0
       max_ohms: 300000.0
       mains_frequency_hz: 60

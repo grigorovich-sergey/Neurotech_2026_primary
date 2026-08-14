@@ -38,17 +38,20 @@ The launch lifecycle is intentionally strict:
 ```text
 connect tracker
 -> calibrate fully
--> connect Guardian, check battery, and pass impedance preflight with raw EEG OFF
--> wait with video/gaze/raw EEG acquisition OFF
--> press SPACE
+-> connect Guardian and check battery with raw EEG OFF
+-> stream and continuously display fitting impedance with video/gaze/raw EEG OFF
+-> press SPACE to accept the fit
+-> stop impedance
 -> start the attempt clock, Guardian raw EEG, display, and fresh MindLink capture
 ```
 
-The SPACE gate reads one console key; Enter is not required. `Q`, `Esc`, or Ctrl-C
-at the gate aborts cleanly without creating a video receiver, enabling gaze streams,
-starting Guardian raw EEG, opening the video display, or starting the attempt clock.
-The prepared Guardian connection is closed, and sensor recording files are created
-only after SPACE.
+The fitting line is refreshed while the gate waits. `None` is shown as waiting for
+the first reading; received values are shown in both ohms and kOhms. `prepare()` is
+not used because its impedance check is finite rather than an operator-controlled
+fitting display. Enter is not required. `Q`, `Esc`, or Ctrl-C stops impedance and
+closes Guardian without creating a video receiver, enabling gaze streams, starting
+Guardian raw EEG, opening the video display, starting the attempt clock, or creating
+sensor recording files.
 
 `MindLinkAdapter.start_capture()` is deliberately called only after the gate. It
 creates a new `VideoReceiver` at that point; no receiver or video transport is
@@ -58,10 +61,10 @@ frame callbacks when a receiver survived calibration and a post-calibration paus
 
 After acquisition starts, press `Q` or `Esc` in the display to stop. The same
 integration-owned attempt clock, whose zero is the SPACE signal, is passed to
-MindLink and Guardian. Practice drains Guardian's bounded queue and writes the EEG
-pipeline/HDF5 on the practice thread. Shutdown cancels and awaits the SDK recording
-task, drains remaining samples, captures the cloud recording ID, and disconnects on
-the SDK owner loop.
+MindLink and Guardian. Practice drains Guardian on the practice thread for its
+monitor-only diagnostics. Shutdown attempts Guardian recording stop, remaining
+sample drain, and Guardian close independently, captures the cloud recording ID,
+and disconnects on the SDK owner loop.
 
 The display includes recognized objects, a high-contrast labelled gaze bullseye,
 current gaze validity/coordinates, current candidate, fixed dwell,

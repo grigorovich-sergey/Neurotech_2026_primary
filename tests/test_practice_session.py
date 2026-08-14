@@ -6,9 +6,9 @@ import numpy as np
 import pytest
 
 from eeg_pipeline.contracts import EEGSample
-from eeg_pipeline.guardian import GuardianPreflight
 from foundations.config import load_resolved_config
 from foundations.contracts import GazeSample, SceneFrame
+from foundations.operator_gate import format_impedance
 from foundations.timebase import MonotonicClock
 from gaze_interaction.contracts import BoundingBox, Detection, TrackedObject, TrackedScene
 from gaze_interaction.dwell import DwellState, DwellTrigger
@@ -333,17 +333,31 @@ def test_prestart_abort_never_starts_clock_capture_display_or_eeg(
         clock_constructions.append("clock")
         return MonotonicClock()
 
-    class FakeGuardianPreflight:
-        def prepare(self, **_: object) -> GuardianPreflight:
-            guardian_lifecycle.append("prepare")
-            return GuardianPreflight(90.0, 10_000.0)
+    class FakeGuardianFitting:
+        def connect(self) -> None:
+            guardian_lifecycle.append("connect")
+
+        def check_battery(self) -> float:
+            guardian_lifecycle.append("battery")
+            return 90.0
+
+        def start_impedance(self, *, mains_frequency_hz: int) -> None:
+            assert mains_frequency_hz == 60
+            guardian_lifecycle.append("impedance_start")
+
+        def latest_impedance(self) -> float:
+            return 10_000.0
+
+        def stop_impedance(self) -> None:
+            guardian_lifecycle.append("impedance_stop")
 
         def close(self) -> None:
             guardian_lifecycle.append("close")
 
     def guardian_factory(**_: object) -> object:
+        assert instances[0].log == ["connect", "calibrate"]
         guardian_constructions.append("guardian")
-        return FakeGuardianPreflight()
+        return FakeGuardianFitting()
 
     monkeypatch.setenv("IDUN_API_TOKEN", "test-token")
     run = run_practice_session(
@@ -359,7 +373,13 @@ def test_prestart_abort_never_starts_clock_capture_display_or_eeg(
     assert instances[0].log == ["connect", "calibrate", "close"]
     assert clock_constructions == []
     assert guardian_constructions == ["guardian"]
-    assert guardian_lifecycle == ["prepare", "close"]
+    assert guardian_lifecycle == [
+        "connect",
+        "battery",
+        "impedance_start",
+        "impedance_stop",
+        "close",
+    ]
     assert not (run / "practice_glasses.h5").exists()
     assert not (run / "practice_eeg.h5").exists()
     assert not (run / "mindlink_frame_metadata.jsonl").exists()
@@ -380,7 +400,7 @@ def test_prestart_abort_never_starts_clock_capture_display_or_eeg(
     assert (
         "[practice setup] calibration complete; MindLink acquisition is OFF" in terminal
     )
-    assert "[practice setup] Guardian ready; raw EEG is OFF" in terminal
+    assert "[practice setup] Guardian fitting; raw EEG is OFF" in terminal
     assert "[practice setup] aborted before acquisition start" in terminal
 
 
@@ -389,6 +409,22 @@ def test_start_signal_ignores_other_keys_and_accepts_only_start_or_abort() -> No
     assert _wait_for_start_signal(lambda: next(keys)) is True
     assert _wait_for_start_signal(lambda: "q") is False
     assert _wait_for_start_signal(lambda: "\x1b") is False
+
+
+def test_fitting_gate_refreshes_impedance_status_and_formats_units() -> None:
+    keys = iter(("x", " "))
+    readings = iter((None, 12_000.0))
+    statuses: list[str] = []
+
+    assert _wait_for_start_signal(
+        lambda: next(keys),
+        status=lambda: f"impedance {format_impedance(next(readings))}",
+        emit=statuses.append,
+    ) is True
+    assert statuses == [
+        "impedance waiting for first reading",
+        "impedance 12.0 kOhm (12000 ohm)",
+    ]
 
 
 def test_decision_reporter_describes_instance_2_transitions(
@@ -556,9 +592,22 @@ def test_optional_eeg_uses_shared_clock_and_stops_with_practice(
             self.recording_id = None
             self.queue_overflowed = False
 
-        def prepare(self, **_: object) -> GuardianPreflight:
-            guardian_lifecycle.append("prepare")
-            return GuardianPreflight(88.0, 12_000.0)
+        def connect(self) -> None:
+            guardian_lifecycle.append("connect")
+
+        def check_battery(self) -> float:
+            guardian_lifecycle.append("battery")
+            return 88.0
+
+        def start_impedance(self, *, mains_frequency_hz: int) -> None:
+            assert mains_frequency_hz == 60
+            guardian_lifecycle.append("impedance_start")
+
+        def latest_impedance(self) -> float:
+            return 12_000.0
+
+        def stop_impedance(self) -> None:
+            guardian_lifecycle.append("impedance_stop")
 
         def start(self, *, recording_seconds: int) -> None:
             guardian_lifecycle.append("start")
@@ -592,7 +641,12 @@ def test_optional_eeg_uses_shared_clock_and_stops_with_practice(
             guardian_lifecycle.append("close")
 
     def start_gate() -> bool:
-        assert guardian_lifecycle == ["construct", "prepare"]
+        assert guardian_lifecycle == [
+            "construct",
+            "connect",
+            "battery",
+            "impedance_start",
+        ]
         return True
 
     monkeypatch.setenv("IDUN_API_TOKEN", "test-token")
@@ -606,7 +660,16 @@ def test_optional_eeg_uses_shared_clock_and_stops_with_practice(
     )
 
     assert mindlink_clocks[0].__self__ is guardian_clocks[0].__self__
-    assert guardian_lifecycle == ["construct", "prepare", "start", "stop", "close"]
+    assert guardian_lifecycle == [
+        "construct",
+        "connect",
+        "battery",
+        "impedance_start",
+        "impedance_stop",
+        "start",
+        "stop",
+        "close",
+    ]
     summary = json.loads((run / "practice_summary.json").read_text(encoding="utf-8"))
     assert summary["successful"] is True
     assert summary["eeg_prepared"] is True
