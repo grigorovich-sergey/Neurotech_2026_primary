@@ -82,6 +82,22 @@ default; `--verbose-decisions` adds candidate/dwell transition lines. See
 [docs/practice_session.md](docs/practice_session.md) for setup, displayed
 diagnostics, artifacts, and current hardware-validation limitations.
 
+## Main live experiment
+
+Run one participant session with a CLI-selected active condition:
+
+```bash
+python scripts/run_experiment.py --subject-id P017 --active-model G
+```
+
+The shadow condition is derived automatically. The concise-only runner calibrates
+MindLink before Guardian fitting, starts acquisition at the SPACE gate, records
+raw glasses/EEG for replay, and advances participant training only after a clean
+duration completion. Attempts and model lineage are separated under
+`runs/subjects/<subject-id>/`. See
+[docs/main_experiment_runner.md](docs/main_experiment_runner.md) for lifecycle,
+timestamp ordering, retry, model-selection provenance, and artifact details.
+
 ## Tests
 
 ```bash

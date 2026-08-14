@@ -151,10 +151,11 @@ The live lifecycle is intentionally strict:
    `eeg_source.drain_remaining()`, and `guardian.close()` independently.
 
 `prepare()` is deliberately not used by this live fitting UI because it performs a
-finite compatibility preflight. The current Integration verifier has no MindLink
-input of its own; the live hardware entry point must complete MindLink calibration
-before entering step 2. `run_practice_session.py --with-eeg` exercises that complete
-calibration -> fitting -> SPACE order.
+finite compatibility preflight. The schedule-backed Integration verifier has no
+MindLink input of its own. `scripts/run_experiment.py` now completes MindLink
+calibration before entering step 2 and uses this same causal EEG source;
+`run_practice_session.py --with-eeg` remains the non-experimental diagnostic path.
+See `docs/main_experiment_runner.md` for the live experimental lifecycle.
 
 `guardian.impedance.duration_seconds` remains in the shared EEG config for the
 standalone finite compatibility workflow; the Integration fitting gate ignores it

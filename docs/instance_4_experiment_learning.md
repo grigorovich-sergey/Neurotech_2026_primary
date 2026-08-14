@@ -110,6 +110,13 @@ session number and load the policy using the artifact digest saved when the
 attempt began. `load_frozen_policy(..., expected_sha256=...)` enforces this even
 if a newer policy file exists elsewhere.
 
+The first live prototype round records an explicit CLI assignment rather than
+activating this CSV path. `assignment_session_NNN.json` records
+`selection_source: cli`, the active condition, and its derived complement. A
+started retry must provide the same CLI active condition. The exact CSV loader and
+header remain unchanged for the schedule-backed verifier and later protocol use;
+its events identify `model_selection_source: csv`.
+
 ## Runtime workflow
 
 For one successful attempt, Instance 5 should:

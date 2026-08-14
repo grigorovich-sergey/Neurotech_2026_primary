@@ -16,6 +16,7 @@ from experiment_learning.features import observation_from_interaction
 from experiment_learning.state_machine import ExperimentController
 from foundations.contracts import GazeSample, SceneFrame
 from foundations.events import Event, JsonlEventLogger
+from gaze_interaction.dwell import DwellTrigger
 from gaze_interaction.episodes import CandidateEpisode, EpisodeEndReason
 from gaze_interaction.pipeline import GazeInteractionPipeline, InteractionUpdate, SceneUpdate
 
@@ -298,6 +299,7 @@ class IntegratedExperimentOrchestrator:
         feedback: FeedbackDriver,
         event_logger: JsonlEventLogger,
         session_id: str,
+        present_action: Callable[[DwellTrigger, InteractionUpdate], float] | None = None,
     ) -> None:
         self.gaze_pipeline = gaze_pipeline
         self.eeg_source = eeg_source
@@ -305,6 +307,7 @@ class IntegratedExperimentOrchestrator:
         self.feedback = feedback
         self.event_logger = event_logger
         self.session_id = session_id
+        self.present_action = present_action
         self._held_score_episode_id: int | None = None
         self._held_score: float | None = None
         self._seen_episode_ids: set[int] = set()
@@ -344,8 +347,18 @@ class IntegratedExperimentOrchestrator:
 
         if interaction.dwell_trigger is not None:
             trigger = interaction.dwell_trigger
+            presentation_timestamp = (
+                float(trigger.timestamp)
+                if self.present_action is None
+                else _timestamp(
+                    "action presentation timestamp",
+                    self.present_action(trigger, interaction),
+                )
+            )
+            if presentation_timestamp < float(trigger.timestamp):
+                raise ValueError("action presentation cannot precede its dwell trigger")
             opened = self.experiment.open_action_feedback(
-                trigger.episode_id, float(trigger.timestamp)
+                trigger.episode_id, presentation_timestamp
             )
             if not opened:
                 raise RuntimeError("dwell trigger did not open its action feedback window")
@@ -357,12 +370,24 @@ class IntegratedExperimentOrchestrator:
                         "episode_id": trigger.episode_id,
                         "track_id": trigger.track_id,
                         "required_seconds": trigger.required_seconds,
+                        "presentation_timestamp": presentation_timestamp,
+                    },
+                )
+            )
+            self.event_logger.log(
+                Event(
+                    presentation_timestamp,
+                    "integration_action_presented",
+                    {
+                        "episode_id": trigger.episode_id,
+                        "track_id": trigger.track_id,
+                        "trigger_timestamp": float(trigger.timestamp),
                     },
                 )
             )
             self.feedback.feedback_opened(
                 episode_id=trigger.episode_id,
-                outcome_timestamp=float(trigger.timestamp),
+                outcome_timestamp=presentation_timestamp,
                 controller=self.experiment,
             )
 
@@ -428,6 +453,15 @@ class IntegratedExperimentOrchestrator:
         return completed_at
 
     def cancel_at_deadline(self, timestamp: float) -> float:
+        value = self.begin_deadline(timestamp)
+        completed_at = value + self.experiment.feedback_timeout_s
+        self.advance_time(completed_at)
+        self.assert_ready_to_complete()
+        return completed_at
+
+    def begin_deadline(self, timestamp: float) -> float:
+        """Stop scientific input at its deadline without skipping live feedback grace."""
+
         value = max(float(timestamp), self.latest_processed_scientific_timestamp)
         self._through(value)
         cancellation = self.gaze_pipeline.cancel(
@@ -443,16 +477,24 @@ class IntegratedExperimentOrchestrator:
                     value,
                     EpisodeEndReason.SESSION_DURATION_REACHED.value,
                 )
-        completed_at = value + self.experiment.feedback_timeout_s
+        return value
+
+    def advance_time(self, timestamp: float) -> None:
+        """Advance live feedback after scientific input has stopped."""
+
+        value = _timestamp("feedback timestamp", timestamp)
         self._apply_feedback_resolutions(
-            self.feedback.before_time(completed_at, self.experiment)
+            self.feedback.before_time(value, self.experiment)
         )
+
+    def assert_ready_to_complete(self) -> None:
+        """Verify that no feedback or replay input remains before session persistence."""
+
         if self.experiment.pending_feedback_episode_id is not None:
             raise RuntimeError("feedback remained unresolved after session deadline")
         assert_consumed = getattr(self.feedback, "assert_consumed", None)
         if assert_consumed is not None:
             assert_consumed()
-        return completed_at
 
     def _through(self, timestamp: float) -> None:
         value = _timestamp("scientific timestamp", timestamp)
