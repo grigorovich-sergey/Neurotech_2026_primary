@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from eeg_pipeline.contracts import EEGSample
+from eeg_pipeline.contracts import EEGSample, EEGWindow, WindowCompleteness
 from eeg_pipeline.guardian import GuardianPreflight
 from experiment_learning.policy import load_frozen_policy
 from experiment_learning.sessions import load_completed_session
@@ -243,14 +243,32 @@ def test_live_guardian_preflight_gate_clock_start_and_independent_cleanup(
             calls.append("guardian_start")
             self.samples = [EEGSample(index / 250.0, 5.0) for index in range(126)]
 
-        def drain(self, *, cutoff_timestamp=None):
+        def check_health(self) -> None:
+            pass
+
+        def finalize_before(self, timestamp: float):
             ready = tuple(
-                sample
-                for sample in self.samples
-                if cutoff_timestamp is None or sample.timestamp <= cutoff_timestamp
+                sample for sample in self.samples if sample.timestamp < timestamp
             )
             self.samples = [sample for sample in self.samples if sample not in ready]
             return ready
+
+        def window(self, start: float, end: float) -> EEGWindow:
+            selected = tuple(
+                sample for sample in self.samples if start <= sample.timestamp <= end
+            )
+            return EEGWindow(
+                start,
+                end,
+                selected,
+                selected[0].timestamp if selected else None,
+                selected[-1].timestamp if selected else None,
+                (
+                    WindowCompleteness.PARTIAL
+                    if selected
+                    else WindowCompleteness.EMPTY
+                ),
+            )
 
         def stop(self) -> None:
             calls.append("stop")
@@ -313,11 +331,23 @@ def test_live_guardian_cleanup_continues_when_stop_fails(
         def start(self, *, recording_seconds: int) -> None:
             assert recording_seconds == 1
 
-        def drain(self, *, cutoff_timestamp=None):
-            del cutoff_timestamp
+        def check_health(self) -> None:
             if self.stopped:
                 calls.append("drain_after_stop")
+
+        def finalize_before(self, timestamp: float):
+            del timestamp
             return ()
+
+        def window(self, start: float, end: float) -> EEGWindow:
+            return EEGWindow(
+                start,
+                end,
+                (),
+                None,
+                None,
+                WindowCompleteness.EMPTY,
+            )
 
         def stop(self) -> None:
             calls.append("stop")

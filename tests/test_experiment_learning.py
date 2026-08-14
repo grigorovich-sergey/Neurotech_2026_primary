@@ -8,6 +8,7 @@ import pytest
 from eeg_pipeline.contracts import (
     EEGFeatureWindow,
     EEGSample,
+    EEGWindow,
     QualityState,
     WindowCompleteness,
 )
@@ -80,33 +81,52 @@ class _EEGSource:
         )
 
 
-class _GuardianQueue:
+class _GuardianWindows:
     def __init__(self, samples: list[EEGSample]) -> None:
         self.samples = samples
-        self.cutoffs: list[float | None] = []
+        self.health_checks = 0
+        self.finalization_boundaries: list[float] = []
+        self.window_requests: list[tuple[float, float]] = []
 
-    def drain(self, *, cutoff_timestamp=None) -> tuple[EEGSample, ...]:
-        self.cutoffs.append(cutoff_timestamp)
+    def check_health(self) -> None:
+        self.health_checks += 1
+
+    def finalize_before(self, timestamp: float) -> tuple[EEGSample, ...]:
+        self.finalization_boundaries.append(timestamp)
         ready = tuple(
-            sample
-            for sample in self.samples
-            if cutoff_timestamp is None or sample.timestamp <= cutoff_timestamp
+            sample for sample in self.samples if sample.timestamp < timestamp
         )
         self.samples = [sample for sample in self.samples if sample not in ready]
         return ready
 
+    def window(self, start: float, end: float) -> EEGWindow:
+        self.window_requests.append((start, end))
+        selected = tuple(
+            sample for sample in self.samples if start <= sample.timestamp <= end
+        )
+        return EEGWindow(
+            requested_start=start,
+            requested_end=end,
+            samples=selected,
+            actual_start=selected[0].timestamp if selected else None,
+            actual_end=selected[-1].timestamp if selected else None,
+            completeness=(
+                WindowCompleteness.PARTIAL
+                if selected
+                else WindowCompleteness.EMPTY
+            ),
+        )
+
 
 class _FeaturePipeline:
     def __init__(self) -> None:
-        self.samples: list[EEGSample] = []
+        self.windows: list[EEGWindow] = []
         self.calls: list[tuple[float, float]] = []
 
-    def add_sample(self, sample: EEGSample) -> None:
-        self.samples.append(sample)
-
-    def features(self, start: float, end: float) -> EEGFeatureWindow:
-        self.calls.append((start, end))
-        return _EEGSource().features(start, end)
+    def features_from_window(self, window: EEGWindow) -> EEGFeatureWindow:
+        self.windows.append(window)
+        self.calls.append((window.requested_start, window.requested_end))
+        return _EEGSource().features(window.requested_start, window.requested_end)
 
 
 class _Recorder:
@@ -271,8 +291,8 @@ def test_schedule_names_active_condition_in_value_error(tmp_path: Path) -> None:
         load_condition_schedule(path)
 
 
-def test_guardian_feature_source_drains_closed_cutoffs_and_records_on_caller() -> None:
-    queued = _GuardianQueue(
+def test_guardian_feature_source_snapshots_and_records_only_finalized_samples() -> None:
+    guardian = _GuardianWindows(
         [
             EEGSample(1.5, 1.0),
             EEGSample(2.0, 2.0),
@@ -282,32 +302,48 @@ def test_guardian_feature_source_drains_closed_cutoffs_and_records_on_caller() -
     pipeline = _FeaturePipeline()
     recorder = _Recorder()
     source = GuardianEEGFeatureSource(
-        guardian=queued,
+        guardian=guardian,
         pipeline=pipeline,
         recorder=recorder,
+        retention_seconds=1.0,
     )
 
-    assert source.drain_through(1.75) == 1
+    assert source.drain_through(1.75) == 0
     window = source.features(1.0, 2.0)
 
-    assert queued.cutoffs == [1.75, 2.0]
-    assert [sample.timestamp for sample in pipeline.samples] == [1.5, 2.0]
-    assert recorder.samples == pipeline.samples
+    assert guardian.health_checks == 2
+    assert guardian.finalization_boundaries == [0.75, 1.0]
+    assert [sample.timestamp for sample in pipeline.windows[0].samples] == [1.5, 2.0]
+    assert recorder.samples == []
     assert pipeline.calls == [(1.0, 2.0)]
     assert window.requested_end == 2.0
-    assert source.ingested_sample_count == 2
-    assert source.last_ingested_timestamp == 2.0
-    assert [sample.timestamp for sample in queued.samples] == [2.25]
+    assert source.finalized_sample_count == 0
+    assert source.last_finalized_timestamp is None
 
-    assert source.drain_remaining() == 1
-    assert [sample.timestamp for sample in pipeline.samples] == [1.5, 2.0, 2.25]
+    assert source.drain_through(2.25) == 0
+    assert source.drain_remaining() == 3
+    assert [sample.timestamp for sample in recorder.samples] == [1.5, 2.0, 2.25]
+    assert source.finalized_sample_count == 3
+    assert source.last_finalized_timestamp == 2.25
 
 
-def test_guardian_feature_source_rejects_future_sample_without_ingesting() -> None:
+def test_guardian_feature_source_rejects_mismatched_snapshot_without_processing() -> None:
     class _ViolatingGuardian:
-        def drain(self, *, cutoff_timestamp=None) -> tuple[EEGSample, ...]:
-            assert cutoff_timestamp == 2.0
-            return (EEGSample(2.001, 1.0),)
+        def check_health(self) -> None:
+            pass
+
+        def finalize_before(self, timestamp: float) -> tuple[EEGSample, ...]:
+            return ()
+
+        def window(self, start: float, end: float) -> EEGWindow:
+            return EEGWindow(
+                0.0,
+                end,
+                (),
+                None,
+                None,
+                WindowCompleteness.EMPTY,
+            )
 
     pipeline = _FeaturePipeline()
     recorder = _Recorder()
@@ -317,16 +353,16 @@ def test_guardian_feature_source_rejects_future_sample_without_ingesting() -> No
         recorder=recorder,
     )
 
-    with pytest.raises(RuntimeError, match="after its closed cutoff"):
+    with pytest.raises(RuntimeError, match="different EEG window"):
         source.features(1.0, 2.0)
 
-    assert pipeline.samples == []
+    assert pipeline.windows == []
     assert recorder.samples == []
     assert pipeline.calls == []
 
 
-def test_controller_prediction_drains_guardian_only_through_its_cutoff() -> None:
-    queued = _GuardianQueue(
+def test_controller_prediction_requests_guardian_snapshot_at_exact_cutoff() -> None:
+    guardian = _GuardianWindows(
         [
             EEGSample(2.2, 1.0),
             EEGSample(2.25, 2.0),
@@ -334,15 +370,15 @@ def test_controller_prediction_drains_guardian_only_through_its_cutoff() -> None
         ]
     )
     pipeline = _FeaturePipeline()
-    source = GuardianEEGFeatureSource(guardian=queued, pipeline=pipeline)
+    source = GuardianEEGFeatureSource(guardian=guardian, pipeline=pipeline)
     controller = _controller(condition=Condition.E)
 
     decision = _evaluate(controller, source)
 
     assert decision.newly_frozen is True
-    assert queued.cutoffs == [2.25]
-    assert [sample.timestamp for sample in pipeline.samples] == [2.2, 2.25]
-    assert [sample.timestamp for sample in queued.samples] == [2.3]
+    assert guardian.window_requests == [(1.25, 2.25)]
+    assert [sample.timestamp for sample in pipeline.windows[0].samples] == [2.2, 2.25]
+    assert [sample.timestamp for sample in guardian.samples] == [2.2, 2.25, 2.3]
 
 
 def test_eeg_decision_uses_only_scalar_index_and_freezes_without_runtime_mutation() -> None:
