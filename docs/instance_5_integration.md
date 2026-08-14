@@ -59,8 +59,10 @@ retries the same session and condition with the same frozen policy.
 
 ## Causal processing order
 
-For every scene or gaze cutoff, Integration drains EEG only through the latest
-processed scientific timestamp. For a confirmed gaze update it then:
+For every scene or gaze cutoff, Integration calls `drain_through` only through the
+latest processed scientific timestamp. Under the PR #20 Guardian source this is a
+health/finalization hook, not callback-order ingestion. For a confirmed gaze update
+it then:
 
 1. resolves feedback presses/timeouts due by the cutoff;
 2. passes the score frozen on update N-1 to Instance 2 update N;
@@ -75,11 +77,14 @@ and accepted feedback cancellation instructions are applied through Instance 2's
 typed `FEEDBACK_INTERRUPTION` cancellation path.
 
 `evaluate_update` receives an EEG feature source, never a bare `EEGPipeline`.
-Each `features(start, end)` request performs a final drain through exactly `end`
-before calculating the unchanged Instance 3 feature window. Future samples are
-not exposed. Battery, impedance, queue overflow, SDK acquisition, and cleanup
-failures are hard attempt errors, not missing-EEG fallbacks. Guardian diagnostics
-are provenance only and never model features.
+Each `features(start, end)` request checks health through exactly `end`, closes data
+older than the requested start, and evaluates the adapter's current ordered 250 Hz
+snapshot. Missing positions are explicit `valid=False` samples. Late packets may
+correct a later overlapping request, but a frozen episode decision is never
+recalculated and future samples are never exposed. Battery, impedance, queue
+overflow, SDK acquisition, and cleanup failures are hard attempt errors, not
+missing-EEG fallbacks. Guardian diagnostics are provenance only and never model
+features.
 
 ## Input and feedback modes
 
@@ -131,18 +136,36 @@ whole-second timer margin around startup and the final scientific cutoff.
 The live lifecycle is intentionally strict:
 
 1. construct `GuardianAdapter(clock=attempt_clock.now, ...)`;
-2. call `prepare(...)` before SPACE, with raw EEG off;
-3. show battery and optional impedance results;
-4. on SPACE, start the attempt clock before `guardian.start(...)`;
-5. construct `GuardianEEGFeatureSource` with the EEG pipeline and raw recorder;
-6. periodically drain through the latest processed scientific timestamp;
-7. on completion or failure, attempt `stop()`, `drain_remaining()`, and `close()`
-   in independent cleanup blocks.
+2. after any gaze calibration owned by the hardware entry point, call
+   `guardian.connect()` and `guardian.check_battery()`;
+3. call `guardian.start_impedance()` with raw EEG still off;
+4. poll `guardian.latest_impedance()` and continuously display `None` as waiting,
+   otherwise showing both ohms and kOhms, until the operator presses SPACE;
+5. stop impedance, enforce the configured impedance limit, and only then start the
+   shared attempt clock;
+6. construct the raw EEG recorder and `GuardianEEGFeatureSource`, then call
+   `guardian.start(...)`;
+7. periodically call `eeg_source.drain_through` at the latest processed scientific
+   timestamp;
+8. on completion or failure, attempt `guardian.stop()`,
+   `eeg_source.drain_remaining()`, and `guardian.close()` independently.
 
-All queue draining, raw HDF5 writes, and `EEGPipeline` mutation occur synchronously
-on the Integration thread. The SDK callback only appends canonical samples to the
-bounded handoff queue. If the operator presses Q or Esc before SPACE, acquisition
-never starts and no completed-session artifact is created.
+`prepare()` is deliberately not used by this live fitting UI because it performs a
+finite compatibility preflight. The schedule-backed Integration verifier has no
+MindLink input of its own. `scripts/run_experiment.py` now completes MindLink
+calibration before entering step 2 and uses this same causal EEG source;
+`run_practice_session.py --with-eeg` remains the non-experimental diagnostic path.
+See `docs/main_experiment_runner.md` for the live experimental lifecycle.
+
+`guardian.impedance.duration_seconds` remains in the shared EEG config for the
+standalone finite compatibility workflow; the Integration fitting gate ignores it
+and continues until SPACE or abort.
+
+All Guardian health checks, ordered-window evaluation, finalized raw HDF5 writes,
+and experiment updates occur synchronously on the Integration thread. The SDK
+callback only updates the bounded timestamp-grid store. If the operator presses Q
+or Esc before SPACE, impedance stops and Guardian closes; the attempt clock, raw
+EEG, experiment acquisition, and completed-session persistence never start.
 
 ## Configuration reference
 
@@ -240,7 +263,9 @@ The participant directory additionally receives
 Abnormal processing or hardware failure emits `integration_session_incomplete`
 after cleanup attempts and re-raises the original error. Incomplete attempts are
 never trainer inputs. There is no mid-attempt sensor rewind or online model state
-to resume.
+to resume. Completion and incomplete lifecycle events include Guardian expired
+sample/block counts so late data that missed the retained correction horizon remain
+visible in provenance.
 
 ## Offline analysis
 
@@ -258,6 +283,7 @@ label.
 ## Hardware validation still required
 
 The deterministic and fake-Guardian paths are covered by tests. Real Guardian
-battery/impedance thresholds, sustained queue capacity, device latency and clock
-alignment, physical feedback hardware, smart-glasses SDK ingestion, and final
-YOLOE/ByteTrack performance still require pilot validation on the target system.
+battery/impedance behavior, sustained timestamp-grid capacity, late/expired packet
+rates, device latency and clock alignment, physical feedback hardware,
+smart-glasses SDK ingestion, and final YOLOE/ByteTrack performance still require
+pilot validation on the target system.

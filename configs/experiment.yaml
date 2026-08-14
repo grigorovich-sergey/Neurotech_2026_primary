@@ -1,0 +1,64 @@
+output_root: runs
+
+runtime:
+  subject_id: null
+  active_model: null
+
+model_selection:
+  source: cli
+  csv:
+    enabled: false
+    schedule_path: configs/experiment_condition_schedule.csv
+    sequence_id: null
+
+session:
+  id_prefix: experiment-session
+  maximum_duration_seconds: 600.0
+
+terminal:
+  concise_decisions: true
+
+recording:
+  glasses_enabled: true
+  eeg_enabled: true
+
+processing:
+  scene_queue_size: 4
+  gaze_queue_size: 4096
+  reorder_hold_seconds: 0.05
+  idle_sleep_seconds: 0.005
+
+feedback:
+  key_code: 32
+  stop_key_codes: [113, 27]
+
+display:
+  enabled: true
+  window_name: NeuroTech experiment
+  selection_banner_seconds: 1.0
+  no_frame_warning_seconds: 3.0
+
+diagnostics:
+  write_mindlink_metadata: true
+
+analysis:
+  enabled: true
+
+controlled_intention:
+  enabled: false
+  protocol_path: null
+  cue_display_seconds: null
+
+subsystem_configs:
+  mindlink:
+    default: configs/mindlink.yaml
+    override: null
+  gaze_interaction:
+    default: configs/gaze_interaction.yaml
+    override: configs/practice_gaze.yaml
+  eeg_pipeline:
+    default: configs/eeg_pipeline.yaml
+    override: configs/practice_eeg.yaml
+  experiment_learning:
+    default: configs/experiment_learning.yaml
+    override: null

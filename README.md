@@ -53,8 +53,9 @@ python scripts/run_integrated_experiment.py
 ```
 
 The runner also supports replay, prerecorded-video/YOLOE input, and live Guardian
-EEG. Live Guardian mode performs battery/impedance preflight with raw EEG off,
-waits for `SPACE`, then starts the shared attempt clock before acquisition. See
+EEG. Live Guardian mode connects and checks battery with raw EEG off, then displays
+continuously refreshed impedance until `SPACE`. It stops impedance and starts the
+shared attempt clock before raw acquisition. See
 [docs/instance_5_integration.md](docs/instance_5_integration.md) for configuration,
 artifact lineage, cleanup guarantees, and retry behavior.
 
@@ -72,13 +73,30 @@ python scripts/run_practice_session.py --concise-decisions
 Guardian EEG is optional and monitor-only; it never changes practice dwell.
 For Guardian, place the single-line API token in the Git-ignored
 `.secrets/idun_api_token` file or set `IDUN_API_TOKEN`. Complete MindLink
-calibration and Guardian battery/impedance preflight first, then press `SPACE` to
-create a fresh video receiver and start the shared attempt clock, gaze/video
-streams, display, and raw EEG. Nothing is recorded during the post-calibration
-wait. Press `Q` or `Esc` to stop after starting. Concise decision reporting is the
+calibration first. Guardian then connects, checks battery, and displays live fitting
+impedance in ohms/kOhms until `SPACE`. The gate stops impedance before it creates a
+fresh video receiver and starts the shared attempt clock, gaze/video streams,
+display, and raw EEG. Nothing is recorded during the post-calibration wait. Press
+`Q` or `Esc` to stop after starting. Concise decision reporting is the
 default; `--verbose-decisions` adds candidate/dwell transition lines. See
 [docs/practice_session.md](docs/practice_session.md) for setup, displayed
 diagnostics, artifacts, and current hardware-validation limitations.
+
+## Main live experiment
+
+Run one participant session with a CLI-selected active condition:
+
+```bash
+python scripts/run_experiment.py --subject-id P017 --active-model G
+```
+
+The shadow condition is derived automatically. The concise-only runner calibrates
+MindLink before Guardian fitting, starts acquisition at the SPACE gate, records
+raw glasses/EEG for replay, and advances participant training only after a clean
+duration completion. Attempts and model lineage are separated under
+`runs/subjects/<subject-id>/`. See
+[docs/main_experiment_runner.md](docs/main_experiment_runner.md) for lifecycle,
+timestamp ordering, retry, model-selection provenance, and artifact details.
 
 ## Tests
 

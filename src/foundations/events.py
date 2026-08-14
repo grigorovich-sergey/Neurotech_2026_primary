@@ -5,6 +5,7 @@ import json
 import math
 from numbers import Real
 from pathlib import Path
+import threading
 from typing import Any
 
 
@@ -36,11 +37,17 @@ class JsonlEventLogger:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text("", encoding="utf-8")
+        self._lock = threading.Lock()
 
     def log(self, event: Event) -> None:
-        with self.path.open("a", encoding="utf-8") as handle:
-            json.dump(asdict(event), handle, allow_nan=False, separators=(",", ":"))
-            handle.write("\n")
+        line = json.dumps(
+            asdict(event),
+            allow_nan=False,
+            separators=(",", ":"),
+        ) + "\n"
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
 
 
 if __name__ == "__main__":

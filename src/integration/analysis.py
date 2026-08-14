@@ -7,6 +7,8 @@ from pathlib import Path
 from statistics import mean, median
 from typing import Any
 
+from experiment_learning.sessions import load_completed_session
+
 
 def _ratio(numerator: int, denominator: int) -> float | None:
     return None if denominator == 0 else numerator / denominator
@@ -198,6 +200,109 @@ def generate_analysis(events_path: str | Path, output_directory: str | Path) -> 
         "e_cumulative_f1",
     )
     with (destination / "learning_curve.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(_learning_rows(records))
+    return summary
+
+
+def generate_participant_analysis(
+    completed_session_paths: list[str | Path] | tuple[str | Path, ...],
+    output_directory: str | Path,
+) -> dict[str, Any]:
+    """Regenerate cumulative participant metrics from admitted session artifacts."""
+
+    sessions = [load_completed_session(path)[0] for path in completed_session_paths]
+    if not sessions:
+        raise ValueError("participant analysis requires at least one completed session")
+    participant_ids = {session.participant_id for session in sessions}
+    if len(participant_ids) != 1:
+        raise ValueError("participant analysis cannot combine different participants")
+    expected = list(range(1, len(sessions) + 1))
+    if [session.session_number for session in sessions] != expected:
+        raise ValueError("participant sessions must be ordered and contiguous")
+    records = [record.to_payload() for session in sessions for record in session.records]
+    usable = _eligible(records)
+    exclusions = Counter(
+        reason
+        for record in records
+        if not record.get("training_eligible")
+        for reason in record.get("exclusion_reasons", [])
+    )
+    latencies = [
+        float(record["action_timestamp"]) - float(record["episode_start_timestamp"])
+        for record in usable
+        if record.get("action_timestamp") is not None
+    ]
+    by_condition: dict[str, Any] = {}
+    for condition in sorted({str(record["active_condition"]) for record in records}):
+        subset = [record for record in records if record["active_condition"] == condition]
+        eligible_subset = _eligible(subset)
+        by_condition[condition] = {
+            "episode_records": len(subset),
+            "training_eligible": len(eligible_subset),
+            "G": _model_metrics(eligible_subset, "g"),
+            "E": _model_metrics(eligible_subset, "e"),
+        }
+    summary = {
+        "schema": "neurotech.participant_analysis.v1",
+        "participant_id": sessions[0].participant_id,
+        "completed_sessions": len(sessions),
+        "latest_session_number": sessions[-1].session_number,
+        "episode_records": len(records),
+        "training_eligible_records": len(usable),
+        "excluded_records": {
+            "count": len(records) - len(usable),
+            "reasons": dict(sorted(exclusions.items())),
+        },
+        "models": {
+            "G": _model_metrics(usable, "g"),
+            "E": _model_metrics(usable, "e"),
+        },
+        "by_active_condition": by_condition,
+        "selection_latency_seconds": _latency_summary(latencies),
+        "sessions": [
+            {
+                "session_number": session.session_number,
+                "session_id": session.session_id,
+                "attempt_id": session.attempt_id,
+                "active_condition": session.active_condition.value,
+                "episode_records": len(session.records),
+                "training_eligible_records": sum(
+                    record.training_eligible for record in session.records
+                ),
+            }
+            for session in sessions
+        ],
+        "scientific_note": (
+            "common_label is feedback-derived; feedback silence is not independently observed ground truth"
+        ),
+    }
+    destination = Path(output_directory)
+    destination.mkdir(parents=True, exist_ok=True)
+    with (destination / "participant_analysis_summary.json").open(
+        "w", encoding="utf-8"
+    ) as handle:
+        json.dump(summary, handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+    columns = (
+        "sample_index",
+        "participant_id",
+        "session_id",
+        "session_number",
+        "episode_id",
+        "active_condition",
+        "common_label",
+        "g_outcome",
+        "e_outcome",
+        "g_cumulative_accuracy",
+        "e_cumulative_accuracy",
+        "g_cumulative_f1",
+        "e_cumulative_f1",
+    )
+    with (destination / "participant_learning_curve.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
         writer.writerows(_learning_rows(records))

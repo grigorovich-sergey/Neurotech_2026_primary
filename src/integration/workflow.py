@@ -9,9 +9,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
-import sys
 import time
 from typing import Any
 
@@ -42,6 +40,7 @@ from experiment_learning.trainer import TrainerConfig, train_next_session_policy
 from foundations.config import load_resolved_config, save_resolved_config
 from foundations.contracts import GazeSample, SceneFrame
 from foundations.events import Event, JsonlEventLogger
+from foundations.operator_gate import format_impedance, wait_for_space_or_abort
 from foundations.recording import HDF5Recorder, HDF5Replay
 from foundations.timebase import MonotonicClock
 from foundations.virtual_glasses import VirtualGlasses
@@ -260,6 +259,12 @@ def _validate_resolved_inputs(
     if eeg_mode == "live":
         duration = config["session"]["maximum_duration_seconds"]
         guardian = _mapping(source, "guardian")
+        impedance = _mapping(guardian, "impedance")
+        if impedance.get("enabled") is not True:
+            raise ValueError("live Guardian fitting requires impedance.enabled: true")
+        _positive_number("Guardian impedance.max_ohms", impedance.get("max_ohms"))
+        if impedance.get("mains_frequency_hz") not in {50, 60}:
+            raise ValueError("Guardian impedance.mains_frequency_hz must be 50 or 60")
         recording_seconds = guardian.get("recording_seconds")
         if (
             isinstance(recording_seconds, bool)
@@ -685,32 +690,17 @@ class _Pacer:
             time.sleep(delay)
 
 
-def _read_single_key() -> str:
-    if os.name == "nt":
-        import msvcrt
-
-        return msvcrt.getwch()
-    if not sys.stdin.isatty():
-        raise RuntimeError("the live Integration SPACE gate requires an interactive terminal")
-    import termios
-    import tty
-
-    descriptor = sys.stdin.fileno()
-    previous = termios.tcgetattr(descriptor)
-    try:
-        tty.setcbreak(descriptor)
-        return sys.stdin.read(1)
-    finally:
-        termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
-
-
-def _wait_for_start_signal(read_key: Callable[[], str] = _read_single_key) -> bool:
-    while True:
-        key = read_key()
-        if key == " ":
-            return True
-        if key in {"q", "Q", "\x1b", "\x03"}:
-            return False
+def _wait_for_start_signal(
+    read_key: Callable[[], str] | None = None,
+    *,
+    status: Callable[[], str] | None = None,
+    emit: Callable[[str], None] | None = None,
+) -> bool:
+    return wait_for_space_or_abort(
+        read_key=read_key,
+        status=status,
+        emit=emit,
+    )
 
 
 def _show_rgb(image) -> None:
@@ -925,7 +915,7 @@ def run_integrated_experiment(
     *,
     guardian_factory: Callable[..., Any] = GuardianAdapter,
     clock_factory: Callable[[], Any] = MonotonicClock,
-    start_gate: Callable[[], bool] = _wait_for_start_signal,
+    start_gate: Callable[[], bool] | None = None,
 ) -> Path:
     """Run one frozen-policy attempt and persist immutable successful inputs."""
 
@@ -954,6 +944,7 @@ def run_integrated_experiment(
                 "session_number": binding.session_number,
                 "attempt_id": binding.attempt_id,
                 "active_condition": binding.condition.value,
+                "model_selection_source": "csv",
                 "sequence_id": binding.schedule_binding.sequence_id,
                 "schedule_sha256": binding.schedule_binding.csv_sha256,
                 "policy_path": str(binding.policy_path),
@@ -994,6 +985,8 @@ def run_integrated_experiment(
     )
     attempt_clock = _DeferredAttemptClock(clock_factory)
     guardian_adapter: Any | None = None
+    guardian_impedance_started = False
+    guardian_started = False
     eeg_source: Any | None = None
     eeg_recorder: EEGHDF5Recorder | None = None
     glasses_recorder: HDF5Recorder | None = None
@@ -1022,37 +1015,75 @@ def run_integrated_experiment(
             events.log(
                 Event(
                     0.0,
-                    "integration_guardian_preflight_started",
+                    "integration_guardian_setup_started",
                     {"phase": "setup", "raw_eeg_active": False},
                 )
             )
-            preflight = guardian_adapter.prepare(
-                impedance_preflight_seconds=(
-                    impedance["duration_seconds"] if impedance["enabled"] else None
-                ),
-                max_impedance_ohms=impedance["max_ohms"],
-                mains_frequency_hz=impedance["mains_frequency_hz"],
-            )
+            guardian_adapter.connect()
+            battery_percent = guardian_adapter.check_battery()
             events.log(
                 Event(
                     0.0,
-                    "integration_guardian_preflight_completed",
+                    "integration_guardian_battery_checked",
                     {
                         "phase": "setup",
                         "raw_eeg_active": False,
-                        "battery_percent": preflight.battery_percent,
-                        "impedance_ohms": preflight.impedance_ohms,
+                        "battery_percent": battery_percent,
                     },
                 )
             )
-            print(
-                "[integration setup] Guardian ready; raw EEG is OFF | "
-                f"battery {preflight.battery_percent:.0f}% | "
-                f"impedance {preflight.impedance_ohms if preflight.impedance_ohms is not None else 'not checked'}",
-                flush=True,
+            if impedance["enabled"] is not True:
+                raise ValueError("live Guardian fitting requires impedance.enabled: true")
+            guardian_adapter.start_impedance(
+                mains_frequency_hz=impedance["mains_frequency_hz"]
             )
-            print("[integration setup] press SPACE to start; Q or Esc to abort", flush=True)
-            should_start = start_gate()
+            guardian_impedance_started = True
+            events.log(
+                Event(
+                    0.0,
+                    "integration_guardian_impedance_started",
+                    {
+                        "phase": "setup",
+                        "raw_eeg_active": False,
+                        "mains_frequency_hz": impedance["mains_frequency_hz"],
+                    },
+                )
+            )
+
+            def fitting_status() -> str:
+                return (
+                    "Guardian fitting; raw EEG is OFF | "
+                    f"battery {battery_percent:.0f}% | "
+                    f"impedance {format_impedance(guardian_adapter.latest_impedance())} | "
+                    "press SPACE to accept fit; Q, Esc, or Ctrl-C to abort"
+                )
+
+            try:
+                if start_gate is None:
+                    should_start = _wait_for_start_signal(
+                        status=fitting_status,
+                        emit=lambda message: print(
+                            f"[integration setup] {message}", flush=True
+                        ),
+                    )
+                else:
+                    print(f"[integration setup] {fitting_status()}", flush=True)
+                    should_start = start_gate()
+            finally:
+                guardian_adapter.stop_impedance()
+                guardian_impedance_started = False
+            impedance_ohms = guardian_adapter.latest_impedance()
+            events.log(
+                Event(
+                    0.0,
+                    "integration_guardian_impedance_stopped",
+                    {
+                        "phase": "setup",
+                        "raw_eeg_active": False,
+                        "impedance_ohms": impedance_ohms,
+                    },
+                )
+            )
             if not isinstance(should_start, bool):
                 raise TypeError("start_gate must return a bool")
             if not should_start:
@@ -1064,6 +1095,13 @@ def run_integrated_experiment(
                     )
                 )
                 raise OperatorAbort("operator aborted before acquisition start")
+            if impedance_ohms is None:
+                raise RuntimeError("Guardian fitting ended before an impedance reading arrived")
+            if impedance_ohms >= impedance["max_ohms"]:
+                raise RuntimeError(
+                    f"Guardian impedance {impedance_ohms:.0f} ohm is not below "
+                    f"configured {impedance['max_ohms']:.0f} ohm threshold"
+                )
             started_at = attempt_clock.start()
             attempt_started = True
             if eeg_config["recording"]["enabled"]:
@@ -1076,6 +1114,7 @@ def run_integrated_experiment(
                 pipeline=eeg_pipeline,
                 recorder=eeg_recorder,
             )
+            guardian_started = True
             guardian_adapter.start(recording_seconds=guardian["recording_seconds"])
         else:
             started_at = 0.0
@@ -1103,6 +1142,7 @@ def run_integrated_experiment(
                     "session_number": binding.session_number,
                     "attempt_id": binding.attempt_id,
                     "active_condition": binding.condition.value,
+                    "model_selection_source": "csv",
                     "policy_sha256": binding.policy_sha256,
                     "maximum_duration_seconds": deadline,
                 },
@@ -1119,7 +1159,7 @@ def run_integrated_experiment(
 
         def health_check(timestamp: float) -> None:
             if guardian_adapter is not None:
-                # drain() propagates acquisition and bounded-queue failures.
+                # PR #20 keeps this as the causal health/finalization hook.
                 eeg_source.drain_through(timestamp)
                 if guardian_adapter.recording_done and timestamp < deadline - 1e-9:
                     raise RuntimeError("Guardian recording ended before the attempt deadline")
@@ -1148,14 +1188,15 @@ def run_integrated_experiment(
     # Guardian cleanup steps are intentionally independent. Failure in one does
     # not prevent the remaining queue from being recorded or the device closing.
     if guardian_adapter is not None:
-        for step, operation in (
-            ("stop", guardian_adapter.stop),
-            (
-                "drain_remaining",
-                eeg_source.drain_remaining if eeg_source is not None else lambda: None,
-            ),
-            ("close", guardian_adapter.close),
-        ):
+        cleanup_operations: list[tuple[str, Callable[[], Any]]] = []
+        if guardian_impedance_started:
+            cleanup_operations.append(("stop_impedance", guardian_adapter.stop_impedance))
+        if guardian_started:
+            cleanup_operations.append(("stop", guardian_adapter.stop))
+        if eeg_source is not None:
+            cleanup_operations.append(("drain_remaining", eeg_source.drain_remaining))
+        cleanup_operations.append(("close", guardian_adapter.close))
+        for step, operation in cleanup_operations:
             try:
                 operation()
             except BaseException as exc:
@@ -1198,8 +1239,19 @@ def run_integrated_experiment(
                     "session_number": binding.session_number,
                     "attempt_id": binding.attempt_id,
                     "active_condition": binding.condition.value,
+                    "model_selection_source": "csv",
                     "attempt_started": attempt_started,
                     "reason": type(primary_error).__name__,
+                    "guardian_lost_sample_count": (
+                        int(getattr(guardian_adapter, "lost_sample_count", 0))
+                        if guardian_adapter is not None
+                        else 0
+                    ),
+                    "guardian_lost_block_count": (
+                        int(getattr(guardian_adapter, "lost_block_count", 0))
+                        if guardian_adapter is not None
+                        else 0
+                    ),
                 },
             )
         )
@@ -1234,6 +1286,7 @@ def run_integrated_experiment(
                 "session_number": binding.session_number,
                 "attempt_id": binding.attempt_id,
                 "active_condition": binding.condition.value,
+                "model_selection_source": "csv",
                 "policy_sha256": binding.policy_sha256,
                 "completed_session_path": str(participant_completed_path),
                 "completed_session_sha256": participant_completed_sha256,
@@ -1246,6 +1299,16 @@ def run_integrated_experiment(
                 "training_status": training.report["status"],
                 "guardian_recording_id": (
                     guardian_adapter.recording_id if guardian_adapter is not None else None
+                ),
+                "guardian_lost_sample_count": (
+                    int(getattr(guardian_adapter, "lost_sample_count", 0))
+                    if guardian_adapter is not None
+                    else 0
+                ),
+                "guardian_lost_block_count": (
+                    int(getattr(guardian_adapter, "lost_block_count", 0))
+                    if guardian_adapter is not None
+                    else 0
                 ),
             },
         )

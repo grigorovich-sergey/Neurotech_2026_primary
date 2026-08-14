@@ -4,13 +4,12 @@ from pathlib import Path
 import pytest
 
 from eeg_pipeline.contracts import EEGSample, EEGWindow, WindowCompleteness
-from eeg_pipeline.guardian import GuardianPreflight
 from experiment_learning.policy import load_frozen_policy
 from experiment_learning.sessions import load_completed_session
 from foundations.config import load_resolved_config
 from integration.analysis import generate_analysis
 from integration.orchestrator import ScheduledFeedbackPress, TimedFeedbackDriver
-from integration.workflow import run_integrated_experiment
+from integration.workflow import OperatorAbort, run_integrated_experiment
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -212,7 +211,7 @@ def test_failed_attempt_does_not_advance_session_or_train(tmp_path: Path) -> Non
     assert (started["session_number"], started["active_condition"]) == (1, "G")
 
 
-def test_live_guardian_preflight_gate_clock_start_and_independent_cleanup(
+def test_live_guardian_fitting_gate_clock_start_and_independent_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[str] = []
@@ -231,11 +230,25 @@ def test_live_guardian_preflight_gate_clock_start_and_independent_cleanup(
             self.samples: list[EEGSample] = []
             self.recording_done = False
             self.recording_id = "fake-recording"
+            self.lost_sample_count = 7
+            self.lost_block_count = 1
 
-        def prepare(self, **kwargs) -> GuardianPreflight:
-            del kwargs
-            calls.append("prepare")
-            return GuardianPreflight(90.0, 10_000.0)
+        def connect(self) -> None:
+            calls.append("connect")
+
+        def check_battery(self) -> float:
+            calls.append("battery")
+            return 90.0
+
+        def start_impedance(self, *, mains_frequency_hz: int) -> None:
+            assert mains_frequency_hz == 60
+            calls.append("impedance_start")
+
+        def latest_impedance(self) -> float:
+            return 10_000.0
+
+        def stop_impedance(self) -> None:
+            calls.append("impedance_stop")
 
         def start(self, *, recording_seconds: int) -> None:
             assert recording_seconds == 1
@@ -284,7 +297,7 @@ def test_live_guardian_preflight_gate_clock_start_and_independent_cleanup(
     eeg_override.write_text(
         "source:\n  mode: live\n  guardian:\n    api_token_env: TEST_UNUSED_TOKEN\n"
         "    api_token_file: null\n    recording_seconds: 1\n"
-        "    impedance:\n      enabled: false\n",
+        "    impedance:\n      enabled: true\n",
         encoding="utf-8",
     )
     config = _config(tmp_path)
@@ -298,12 +311,23 @@ def test_live_guardian_preflight_gate_clock_start_and_independent_cleanup(
         start_gate=gate,
     )
 
-    assert calls[:4] == ["prepare", "gate", "clock_start", "guardian_start"]
+    assert calls[:6] == [
+        "connect",
+        "battery",
+        "impedance_start",
+        "gate",
+        "impedance_stop",
+        "clock_start",
+    ]
+    assert calls[6] == "guardian_start"
     assert calls[-2:] == ["stop", "close"]
     events = _events(run)
-    assert _named(events, "integration_guardian_preflight_completed")
+    assert _named(events, "integration_guardian_battery_checked")
+    assert _named(events, "integration_guardian_impedance_stopped")
     completion = _named(events, "integration_session_completed")[0]["payload"]
     assert completion["guardian_recording_id"] == "fake-recording"
+    assert completion["guardian_lost_sample_count"] == 7
+    assert completion["guardian_lost_block_count"] == 1
     assert (run / "raw_eeg.h5").is_file()
 
 
@@ -324,9 +348,20 @@ def test_live_guardian_cleanup_continues_when_stop_fails(
             del kwargs
             self.stopped = False
 
-        def prepare(self, **kwargs) -> GuardianPreflight:
-            del kwargs
-            return GuardianPreflight(90.0, None)
+        def connect(self) -> None:
+            pass
+
+        def check_battery(self) -> float:
+            return 90.0
+
+        def start_impedance(self, *, mains_frequency_hz: int) -> None:
+            assert mains_frequency_hz == 60
+
+        def latest_impedance(self) -> float:
+            return 10_000.0
+
+        def stop_impedance(self) -> None:
+            pass
 
         def start(self, *, recording_seconds: int) -> None:
             assert recording_seconds == 1
@@ -361,7 +396,7 @@ def test_live_guardian_cleanup_continues_when_stop_fails(
     eeg_override.write_text(
         "source:\n  mode: live\n  guardian:\n    api_token_env: TEST_UNUSED_TOKEN\n"
         "    api_token_file: null\n    recording_seconds: 1\n"
-        "    impedance:\n      enabled: false\n",
+        "    impedance:\n      enabled: true\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("TEST_UNUSED_TOKEN", "fake-token")
@@ -382,3 +417,153 @@ def test_live_guardian_cleanup_continues_when_stop_fails(
     assert not list(participant.glob("completed_session_*.json"))
     run = next((Path(config["output_root"]) / "integration").iterdir())
     assert _named(_events(run), "integration_session_incomplete")
+
+
+def test_live_guardian_abort_stops_fitting_without_starting_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    class FakeGuardian:
+        recording_done = False
+        recording_id = None
+
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        def connect(self) -> None:
+            calls.append("connect")
+
+        def check_battery(self) -> float:
+            calls.append("battery")
+            return 90.0
+
+        def start_impedance(self, *, mains_frequency_hz: int) -> None:
+            assert mains_frequency_hz == 60
+            calls.append("impedance_start")
+
+        def latest_impedance(self) -> None:
+            return None
+
+        def stop_impedance(self) -> None:
+            calls.append("impedance_stop")
+
+        def start(self, *, recording_seconds: int) -> None:
+            del recording_seconds
+            calls.append("unexpected_recording_start")
+
+        def close(self) -> None:
+            calls.append("close")
+
+    def clock_factory():
+        calls.append("unexpected_clock_start")
+        return object()
+
+    def gate() -> bool:
+        calls.append("gate")
+        return False
+
+    eeg_override = tmp_path / "live_eeg.yaml"
+    eeg_override.write_text(
+        "source:\n  mode: live\n  guardian:\n    api_token_env: TEST_UNUSED_TOKEN\n"
+        "    api_token_file: null\n    recording_seconds: 1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TEST_UNUSED_TOKEN", "fake-token")
+    config = _config(tmp_path)
+    config["session"]["maximum_duration_seconds"] = 0.1
+    config["subsystem_config_overrides"]["eeg_pipeline"] = str(eeg_override)
+
+    with pytest.raises(OperatorAbort, match="aborted before acquisition start"):
+        run_integrated_experiment(
+            config,
+            guardian_factory=FakeGuardian,
+            clock_factory=clock_factory,
+            start_gate=gate,
+        )
+
+    assert calls == [
+        "connect",
+        "battery",
+        "impedance_start",
+        "gate",
+        "impedance_stop",
+        "close",
+    ]
+    run = next((Path(config["output_root"]) / "integration").iterdir())
+    assert not (run / "raw_eeg.h5").exists()
+    assert not (run / "completed_session.json").exists()
+    assert _named(_events(run), "integration_setup_aborted")
+
+
+def test_live_guardian_rejects_high_impedance_before_clock_and_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    class HighImpedanceGuardian:
+        recording_done = False
+        recording_id = None
+
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        def connect(self) -> None:
+            calls.append("connect")
+
+        def check_battery(self) -> float:
+            calls.append("battery")
+            return 90.0
+
+        def start_impedance(self, *, mains_frequency_hz: int) -> None:
+            assert mains_frequency_hz == 60
+            calls.append("impedance_start")
+
+        def latest_impedance(self) -> float:
+            return 400_000.0
+
+        def stop_impedance(self) -> None:
+            calls.append("impedance_stop")
+
+        def start(self, *, recording_seconds: int) -> None:
+            del recording_seconds
+            calls.append("unexpected_recording_start")
+
+        def close(self) -> None:
+            calls.append("close")
+
+    def clock_factory():
+        calls.append("unexpected_clock_start")
+        return object()
+
+    eeg_override = tmp_path / "live_eeg.yaml"
+    eeg_override.write_text(
+        "source:\n  mode: live\n  guardian:\n    api_token_env: TEST_UNUSED_TOKEN\n"
+        "    api_token_file: null\n    recording_seconds: 1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TEST_UNUSED_TOKEN", "fake-token")
+    config = _config(tmp_path)
+    config["session"]["maximum_duration_seconds"] = 0.1
+    config["subsystem_config_overrides"]["eeg_pipeline"] = str(eeg_override)
+
+    with pytest.raises(RuntimeError, match="is not below configured"):
+        run_integrated_experiment(
+            config,
+            guardian_factory=HighImpedanceGuardian,
+            clock_factory=clock_factory,
+            start_gate=lambda: True,
+        )
+
+    assert calls == [
+        "connect",
+        "battery",
+        "impedance_start",
+        "impedance_stop",
+        "close",
+    ]
+    run = next((Path(config["output_root"]) / "integration").iterdir())
+    assert not (run / "raw_eeg.h5").exists()
+    assert not (run / "completed_session.json").exists()
+    incomplete = _named(_events(run), "integration_session_incomplete")[0]["payload"]
+    assert incomplete["attempt_started"] is False

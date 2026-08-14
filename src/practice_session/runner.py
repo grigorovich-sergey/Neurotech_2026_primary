@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
 import json
 import math
-import os
 from pathlib import Path
 import platform
 import queue
@@ -29,6 +28,7 @@ from eeg_pipeline.recording import EEGHDF5Recorder
 from foundations.config import load_resolved_config, save_resolved_config
 from foundations.contracts import GazeSample, SceneFrame
 from foundations.events import Event, JsonlEventLogger
+from foundations.operator_gate import format_impedance, wait_for_space_or_abort
 from foundations.recording import HDF5Recorder
 from foundations.timebase import MonotonicClock
 from gaze_interaction.association import GazeAssociator
@@ -260,41 +260,19 @@ class _DeferredAttemptClock:
         return 0.0 if clock is None else float(clock.now())
 
 
-def _read_single_key() -> str:
-    """Read one console key without requiring Enter on Windows or POSIX."""
-
-    if os.name == "nt":
-        import msvcrt
-
-        return msvcrt.getwch()
-    if not sys.stdin.isatty():
-        raise RuntimeError("the practice SPACE gate requires an interactive terminal")
-
-    import termios
-    import tty
-
-    descriptor = sys.stdin.fileno()
-    previous = termios.tcgetattr(descriptor)
-    try:
-        tty.setcbreak(descriptor)
-        return sys.stdin.read(1)
-    finally:
-        termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
-
-
 def _wait_for_start_signal(
-    read_key: Callable[[], str] = _read_single_key,
+    read_key: Callable[[], str] | None = None,
+    *,
+    status: Callable[[], str] | None = None,
+    emit: Callable[[str], None] | None = None,
 ) -> bool:
     """Return only for SPACE (start) or Q/Esc/Ctrl-C (abort)."""
 
-    if not callable(read_key):
-        raise TypeError("read_key must be callable")
-    while True:
-        key = read_key()
-        if key == " ":
-            return True
-        if key in {"q", "Q", "\x1b", "\x03"}:
-            return False
+    return wait_for_space_or_abort(
+        read_key=read_key,
+        status=status,
+        emit=emit,
+    )
 
 
 class _JsonlWriter:
@@ -898,15 +876,26 @@ def run_practice_session(
     mindlink_factory: Callable[..., Any] = MindLinkAdapter,
     guardian_factory: Callable[..., Any] = GuardianAdapter,
     clock_factory: Callable[[], MonotonicClock] = MonotonicClock,
-    start_gate: Callable[[], bool] = _wait_for_start_signal,
+    start_gate: Callable[[], bool] | None = None,
 ) -> Path:
     """Run a live diagnostic; never create experimental or training artifacts."""
 
     _validate_config(config)
-    if not callable(start_gate):
-        raise TypeError("start_gate must be callable")
+    if start_gate is not None and not callable(start_gate):
+        raise TypeError("start_gate must be callable or None")
     resolved = deepcopy(config)
     mindlink_config, gaze_config, eeg_config = _load_subsystem_configs(resolved)
+    if resolved["eeg"]["enabled"]:
+        source = _mapping(eeg_config, "source")
+        if source.get("mode") != "live":
+            raise ValueError("practice EEG requires EEG source.mode: live")
+        guardian = _mapping(source, "guardian")
+        impedance = _mapping(guardian, "impedance")
+        if impedance.get("enabled") is not True:
+            raise ValueError("live Guardian fitting requires impedance.enabled: true")
+        _positive_number("Guardian impedance.max_ohms", impedance.get("max_ohms"))
+        if impedance.get("mains_frequency_hz") not in {50, 60}:
+            raise ValueError("Guardian impedance.mains_frequency_hz must be 50 or 60")
     gaze_pipeline = _build_gaze_pipeline(gaze_config, detector=detector, tracker=tracker)
     run_directory = _new_run_directory(resolved["output_root"])
     _write_environment_manifest(run_directory)
@@ -1053,6 +1042,7 @@ def run_practice_session(
     eeg_recorder: EEGHDF5Recorder | None = None
     guardian_adapter: Any | None = None
     guardian_preflight: GuardianPreflight | None = None
+    guardian_impedance_started = False
     guardian_started = False
 
     adapter: Any | None = None
@@ -1141,41 +1131,76 @@ def run_practice_session(
             impedance = guardian["impedance"]
             events.log(
                 0.0,
-                "practice_guardian_preflight_started",
+                "practice_guardian_setup_started",
                 {"phase": "setup", "raw_eeg_active": False},
             )
-            terminal.setup("connecting to Guardian and running preflight")
-            guardian_preflight = guardian_adapter.prepare(
-                impedance_preflight_seconds=(
-                    impedance["duration_seconds"] if impedance["enabled"] else None
-                ),
-                max_impedance_ohms=impedance["max_ohms"],
-                mains_frequency_hz=impedance["mains_frequency_hz"],
+            terminal.setup("connecting to Guardian after MindLink calibration")
+            guardian_adapter.connect()
+            battery_percent = guardian_adapter.check_battery()
+            events.log(
+                0.0,
+                "practice_guardian_battery_checked",
+                {
+                    "phase": "setup",
+                    "raw_eeg_active": False,
+                    "battery_percent": battery_percent,
+                },
+            )
+            guardian_adapter.start_impedance(
+                mains_frequency_hz=impedance["mains_frequency_hz"]
+            )
+            guardian_impedance_started = True
+            events.log(
+                0.0,
+                "practice_guardian_impedance_started",
+                {
+                    "phase": "setup",
+                    "raw_eeg_active": False,
+                    "mains_frequency_hz": impedance["mains_frequency_hz"],
+                },
+            )
+
+            def fitting_status() -> str:
+                return (
+                    "Guardian fitting; raw EEG is OFF | "
+                    f"battery {battery_percent:.0f}% | "
+                    f"impedance {format_impedance(guardian_adapter.latest_impedance())} | "
+                    "press SPACE to accept fit; Q, Esc, or Ctrl-C to abort"
+                )
+
+            try:
+                if start_gate is None:
+                    should_start = _wait_for_start_signal(
+                        status=fitting_status,
+                        emit=terminal.setup,
+                    )
+                else:
+                    terminal.setup(fitting_status())
+                    should_start = start_gate()
+            finally:
+                guardian_adapter.stop_impedance()
+                guardian_impedance_started = False
+            impedance_ohms = guardian_adapter.latest_impedance()
+            guardian_preflight = GuardianPreflight(
+                battery_percent,
+                impedance_ohms,
             )
             eeg_monitor.prepared(guardian_preflight)
             events.log(
                 0.0,
-                "practice_guardian_preflight_completed",
+                "practice_guardian_impedance_stopped",
                 {
                     "phase": "setup",
                     "raw_eeg_active": False,
-                    "battery_percent": guardian_preflight.battery_percent,
-                    "impedance_ohms": guardian_preflight.impedance_ohms,
+                    "impedance_ohms": impedance_ohms,
                 },
             )
-            impedance_text = (
-                "not checked"
-                if guardian_preflight.impedance_ohms is None
-                else f"{guardian_preflight.impedance_ohms:.0f} ohm"
+        else:
+            terminal.setup("press SPACE to start; Q, Esc, or Ctrl-C to abort")
+            should_start = (
+                _wait_for_start_signal() if start_gate is None else start_gate()
             )
-            terminal.setup(
-                "Guardian ready; raw EEG is OFF | "
-                f"battery {guardian_preflight.battery_percent:.0f}% | "
-                f"impedance {impedance_text}"
-            )
-        terminal.setup("press SPACE to start; Q, Esc, or Ctrl-C to abort")
 
-        should_start = start_gate()
         if not isinstance(should_start, bool):
             raise TypeError("start_gate must return a bool")
         if not should_start:
@@ -1187,6 +1212,17 @@ def run_practice_session(
             )
             terminal.setup("aborted before acquisition start")
         else:
+            if guardian_preflight is not None:
+                if guardian_preflight.impedance_ohms is None:
+                    raise RuntimeError(
+                        "Guardian fitting ended before an impedance reading arrived"
+                    )
+                impedance = eeg_config["source"]["guardian"]["impedance"]
+                if guardian_preflight.impedance_ohms >= impedance["max_ohms"]:
+                    raise RuntimeError(
+                        f"Guardian impedance {guardian_preflight.impedance_ohms:.0f} ohm "
+                        f"is not below configured {impedance['max_ohms']:.0f} ohm threshold"
+                    )
             attempt_started_at = clock.start()
             events.log(
                 attempt_started_at,
@@ -1217,8 +1253,8 @@ def run_practice_session(
                         sample_rate_hz=eeg_config["signal"]["sample_rate_hz"],
                     )
                 eeg_monitor.set_recorder(eeg_recorder)
-                guardian_adapter.start(recording_seconds=guardian["recording_seconds"])
                 guardian_started = True
+                guardian_adapter.start(recording_seconds=guardian["recording_seconds"])
                 eeg_monitor.started()
                 guardian_started_at = clock.now()
                 events.log(
@@ -1408,13 +1444,24 @@ def run_practice_session(
                 if state.failure is None:
                     state.request_stop("mindlink_close_error", exc)
         if guardian_adapter is not None:
+            if guardian_impedance_started:
+                try:
+                    guardian_adapter.stop_impedance()
+                    guardian_impedance_started = False
+                except BaseException as exc:
+                    if state.failure is None:
+                        fail("guardian_impedance_stop_error", exc)
             if guardian_started:
                 try:
                     guardian_adapter.stop()
-                    drain_guardian(None)
                 except BaseException as exc:
                     if state.failure is None:
                         fail("guardian_stop_error", exc)
+                try:
+                    drain_guardian(None)
+                except BaseException as exc:
+                    if state.failure is None:
+                        fail("guardian_drain_error", exc)
                 if eeg_monitor is not None:
                     eeg_monitor.stopped(
                         recording_id=getattr(guardian_adapter, "recording_id", None),
