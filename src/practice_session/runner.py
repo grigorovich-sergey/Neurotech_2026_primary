@@ -25,6 +25,7 @@ from eeg_pipeline.guardian import GuardianAdapter, GuardianPreflight
 from eeg_pipeline.pipeline import EEGPipeline
 from eeg_pipeline.processing import EEGFeatureExtractor, EEGPreprocessor, EEGQualityGate
 from eeg_pipeline.recording import EEGHDF5Recorder
+from experiment_learning.guardian_source import GuardianEEGFeatureSource
 from foundations.config import load_resolved_config, save_resolved_config
 from foundations.contracts import GazeSample, SceneFrame
 from foundations.events import Event, JsonlEventLogger
@@ -604,13 +605,13 @@ class _Diagnostics:
 class _EEGMonitor:
     def __init__(
         self,
-        pipeline: EEGPipeline,
         recorder: EEGHDF5Recorder | None,
         *,
         sample_rate_hz: float,
+        on_sample_timestamp: Callable[[float], None] | None = None,
     ) -> None:
-        self.pipeline = pipeline
         self.recorder = recorder
+        self.on_sample_timestamp = on_sample_timestamp
         self.expected_interval_seconds = 1.0 / sample_rate_hz
         self.lock = threading.Lock()
         self.sample_count = 0
@@ -643,11 +644,14 @@ class _EEGMonitor:
         with self.lock:
             self.status = "recording"
 
-    def ingest(self, sample: EEGSample) -> None:
+    def record(self, sample: EEGSample) -> None:
+        """Record one finalized, chronological Guardian sample."""
+
         with self.lock:
             if self.recorder is not None:
                 self.recorder.record(sample)
-            self.pipeline.add_sample(sample)
+            if self.on_sample_timestamp is not None:
+                self.on_sample_timestamp(float(sample.timestamp))
             self.sample_count += 1
             if self.first_timestamp is None:
                 self.first_timestamp = sample.timestamp
@@ -669,12 +673,18 @@ class _EEGMonitor:
                     )
             self.status = "streaming"
 
-    def refresh(self, window_seconds: float) -> None:
+    def refresh(
+        self,
+        source: GuardianEEGFeatureSource,
+        *,
+        cutoff_timestamp: float,
+        window_seconds: float,
+    ) -> None:
+        window = source.features(
+            max(0.0, cutoff_timestamp - window_seconds),
+            cutoff_timestamp,
+        )
         with self.lock:
-            if self.last_timestamp is None:
-                return
-            start = max(0.0, self.last_timestamp - window_seconds)
-            window = self.pipeline.features(start, self.last_timestamp)
             self.quality_state = window.quality_state.value
             self.quality_reasons = window.quality_reasons
 
@@ -1039,6 +1049,8 @@ def run_practice_session(
         fail("mindlink_disconnect", RuntimeError(f"MindLink disconnected: {error}"))
 
     eeg_monitor: _EEGMonitor | None = None
+    eeg_pipeline: EEGPipeline | None = None
+    eeg_source: GuardianEEGFeatureSource | None = None
     eeg_recorder: EEGHDF5Recorder | None = None
     guardian_adapter: Any | None = None
     guardian_preflight: GuardianPreflight | None = None
@@ -1060,12 +1072,10 @@ def run_practice_session(
     warned_no_frame = False
     display_started = False
 
-    def drain_guardian(cutoff_timestamp: float | None) -> None:
-        if not guardian_started or guardian_adapter is None or eeg_monitor is None:
+    def drain_guardian(cutoff_timestamp: float) -> None:
+        if not guardian_started or eeg_source is None:
             return
-        for sample in guardian_adapter.drain(cutoff_timestamp=cutoff_timestamp):
-            diagnostics.eeg(sample.timestamp)
-            eeg_monitor.ingest(sample)
+        eeg_source.drain_through(cutoff_timestamp)
 
     try:
         capture = mindlink_config["capture"]
@@ -1111,9 +1121,9 @@ def run_practice_session(
             eeg_pipeline = _build_eeg_pipeline(eeg_config)
             sample_rate_hz = eeg_config["signal"]["sample_rate_hz"]
             eeg_monitor = _EEGMonitor(
-                eeg_pipeline,
                 None,
                 sample_rate_hz=sample_rate_hz,
+                on_sample_timestamp=diagnostics.eeg,
             )
             guardian = eeg_config["source"]["guardian"]
             api_token = load_guardian_api_token(
@@ -1253,6 +1263,12 @@ def run_practice_session(
                         sample_rate_hz=eeg_config["signal"]["sample_rate_hz"],
                     )
                 eeg_monitor.set_recorder(eeg_recorder)
+                assert eeg_pipeline is not None
+                eeg_source = GuardianEEGFeatureSource(
+                    guardian=guardian_adapter,
+                    pipeline=eeg_pipeline,
+                    recorder=eeg_monitor,
+                )
                 guardian_started = True
                 guardian_adapter.start(recording_seconds=guardian["recording_seconds"])
                 eeg_monitor.started()
@@ -1351,10 +1367,15 @@ def run_practice_session(
 
             if (
                 eeg_monitor is not None
+                and eeg_source is not None
                 and now - last_eeg_refresh
                 >= processing["eeg_status_refresh_seconds"]
             ):
-                eeg_monitor.refresh(processing["eeg_status_window_seconds"])
+                eeg_monitor.refresh(
+                    eeg_source,
+                    cutoff_timestamp=now,
+                    window_seconds=processing["eeg_status_window_seconds"],
+                )
                 last_eeg_refresh = now
 
             if (
@@ -1458,7 +1479,8 @@ def run_practice_session(
                     if state.failure is None:
                         fail("guardian_stop_error", exc)
                 try:
-                    drain_guardian(None)
+                    if eeg_source is not None:
+                        eeg_source.drain_remaining()
                 except BaseException as exc:
                     if state.failure is None:
                         fail("guardian_drain_error", exc)

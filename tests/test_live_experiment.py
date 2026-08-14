@@ -210,6 +210,26 @@ def test_live_input_merger_orders_streams_and_makes_gaze_overflow_hard(
     assert failures[-1][0] == "mindlink_gaze_queue_overflow"
 
 
+def test_live_input_merger_bounds_scenes_after_callback_drain(tmp_path: Path) -> None:
+    merger = LiveInputMerger(
+        scene_queue_size=1,
+        gaze_queue_size=8,
+        reorder_hold_seconds=0.0,
+        event_logger=JsonlEventLogger(tmp_path / "events.jsonl"),
+        failure_callback=lambda source, error: pytest.fail(f"{source}: {error}"),
+    )
+    first = SceneFrame(1.0, np.zeros((2, 2, 3), dtype=np.uint8))
+    newest = SceneFrame(2.0, np.ones((2, 2, 3), dtype=np.uint8))
+
+    merger.on_scene(first)
+    assert merger.has_pending() is True  # moves the frame into the timestamp heap
+    merger.on_scene(newest)
+
+    assert merger.pop_ready(force=True) == ("scene", newest)
+    assert merger.scene_queue_drop_count == 1
+    assert merger.has_pending() is False
+
+
 def test_pre_space_abort_creates_no_assignment_or_completed_session(tmp_path: Path) -> None:
     run = _run(_config(tmp_path, "P-abort"), start=False)
     summary = json.loads((run / "attempt_summary.json").read_text(encoding="utf-8"))

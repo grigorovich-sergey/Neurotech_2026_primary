@@ -57,6 +57,7 @@ class LiveInputMerger:
         self.scene_queue: queue.Queue[tuple[SceneFrame, float]] = queue.Queue(
             maxsize=scene_queue_size
         )
+        self.scene_queue_size = scene_queue_size
         self.gaze_queue: queue.Queue[tuple[GazeSample, float]] = queue.Queue(
             maxsize=gaze_queue_size
         )
@@ -82,15 +83,39 @@ class LiveInputMerger:
                 dropped, _ = self.scene_queue.get_nowait()
             except queue.Empty:  # pragma: no cover - defensive queue race
                 dropped = sample
-            self.scene_queue_drop_count += 1
-            self.event_logger.log(
-                Event(
-                    float(dropped.timestamp),
-                    "experiment_live_scene_queue_drop",
-                    {"count": self.scene_queue_drop_count},
-                )
-            )
+            self._record_scene_drop(dropped)
             self.scene_queue.put_nowait(item)
+
+    def _record_scene_drop(self, sample: SceneFrame) -> None:
+        self.scene_queue_drop_count += 1
+        self.event_logger.log(
+            Event(
+                float(sample.timestamp),
+                "experiment_live_scene_queue_drop",
+                {"count": self.scene_queue_drop_count},
+            )
+        )
+
+    def _push_buffered(self, item: _BufferedInput) -> None:
+        if item.stream == "scene":
+            pending_scenes = [
+                (index, pending)
+                for index, pending in enumerate(self._heap)
+                if pending.stream == "scene"
+            ]
+            if len(pending_scenes) >= self.scene_queue_size:
+                dropped_index, dropped = min(
+                    pending_scenes,
+                    key=lambda value: (
+                        value[1].timestamp,
+                        value[1].sequence,
+                    ),
+                )
+                del self._heap[dropped_index]
+                heapq.heapify(self._heap)
+                assert isinstance(dropped.sample, SceneFrame)
+                self._record_scene_drop(dropped.sample)
+        heapq.heappush(self._heap, item)
 
     def on_gaze(self, sample: GazeSample) -> None:
         if not isinstance(sample, GazeSample):
@@ -167,8 +192,7 @@ class LiveInputMerger:
                     continue
                 self._latest_seen[stream] = timestamp
                 self._sequence += 1
-                heapq.heappush(
-                    self._heap,
+                self._push_buffered(
                     _BufferedInput(
                         timestamp,
                         priority,

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from eeg_pipeline.contracts import EEGSample
+from eeg_pipeline.contracts import EEGSample, EEGWindow, WindowCompleteness
 from foundations.config import load_resolved_config
 from foundations.contracts import GazeSample, SceneFrame
 from foundations.operator_gate import format_impedance
@@ -613,7 +613,7 @@ def test_optional_eeg_uses_shared_clock_and_stops_with_practice(
             guardian_lifecycle.append("start")
             assert recording_seconds > 0
             start = self.clock()
-            for index in range(20):
+            for index in range(12):
                 timestamp = start + index * 0.004
                 self.samples.append(
                     EEGSample(
@@ -623,14 +623,49 @@ def test_optional_eeg_uses_shared_clock_and_stops_with_practice(
                     )
                 )
 
-        def drain(self, *, cutoff_timestamp=None) -> tuple[EEGSample, ...]:
-            ready = []
-            while self.samples and (
-                cutoff_timestamp is None
-                or self.samples[0].timestamp <= cutoff_timestamp
-            ):
-                ready.append(self.samples.pop(0))
+            # Callback blocks may arrive out of order; the practice path must
+            # consume the Guardian's ordered snapshot/finalization interface.
+            self.samples[5:10] = reversed(self.samples[5:10])
+
+        def check_health(self) -> None:
+            pass
+
+        def finalize_before(self, timestamp: float) -> tuple[EEGSample, ...]:
+            ready = sorted(
+                (sample for sample in self.samples if sample.timestamp < timestamp),
+                key=lambda sample: sample.timestamp,
+            )
+            self.samples = [
+                sample for sample in self.samples if sample.timestamp >= timestamp
+            ]
             return tuple(ready)
+
+        def window(self, start: float, end: float) -> EEGWindow:
+            selected = tuple(
+                sorted(
+                    (
+                        sample
+                        for sample in self.samples
+                        if start <= sample.timestamp <= end
+                    ),
+                    key=lambda sample: sample.timestamp,
+                )
+            )
+            return EEGWindow(
+                start,
+                end,
+                selected,
+                selected[0].timestamp if selected else None,
+                selected[-1].timestamp if selected else None,
+                (
+                    WindowCompleteness.COMPLETE
+                    if selected
+                    else WindowCompleteness.EMPTY
+                ),
+            )
+
+        def drain(self, **_: object) -> tuple[EEGSample, ...]:
+            raise AssertionError("practice must not use legacy Guardian drain()")
 
         def stop(self) -> None:
             guardian_lifecycle.append("stop")
@@ -674,7 +709,7 @@ def test_optional_eeg_uses_shared_clock_and_stops_with_practice(
     assert summary["successful"] is True
     assert summary["eeg_prepared"] is True
     assert summary["eeg_started"] is True
-    assert summary["eeg"]["sample_count"] == 20
+    assert summary["eeg"]["sample_count"] == 12
     assert summary["eeg"]["battery_percent"] == 88.0
     assert summary["eeg"]["impedance_ohms"] == 12_000.0
     assert summary["eeg"]["recording_id"] == "practice-recording"

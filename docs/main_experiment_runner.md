@@ -66,11 +66,17 @@ MindLink callbacks only enqueue canonical values. The Integration thread perform
 HDF5 recording and scientific processing. A configurable bounded reorder hold
 merges scene and gaze timestamps before they reach the orchestrator.
 
-- Scene frames may be dropped when the bounded scene queue is full; every drop is
-  explicit in `events.jsonl`.
+- Scene frames are latest-value data. Their configured bound applies across both
+  the callback queue and timestamp-merger heap, so slow detector inference cannot
+  accumulate an unbounded stale-scene backlog. Superseded scenes are dropped
+  explicitly in `events.jsonl`.
 - A late scene is dropped explicitly rather than moving scientific time backward.
 - Gaze queue overflow, late gaze, acquisition failure, Guardian overflow, and
   recording failure are hard attempt errors. Gaze is never silently dropped.
+- Up to `processing.gaze_batch_size` ordered inputs are processed before one UI
+  render/key-poll cycle, matching the responsive practice scheduling pattern.
+  Processing stops after a scene inference so consecutive expensive detector
+  calls cannot starve gaze and UI work.
 - EEG drains only through the latest processed scientific timestamp. Exact
   feature requests retain PR #20's causal Guardian-window behavior.
 

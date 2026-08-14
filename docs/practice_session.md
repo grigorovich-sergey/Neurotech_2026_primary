@@ -61,10 +61,13 @@ frame callbacks when a receiver survived calibration and a post-calibration paus
 
 After acquisition starts, press `Q` or `Esc` in the display to stop. The same
 integration-owned attempt clock, whose zero is the SPACE signal, is passed to
-MindLink and Guardian. Practice drains Guardian on the practice thread for its
-monitor-only diagnostics. Shutdown attempts Guardian recording stop, remaining
-sample drain, and Guardian close independently, captures the cloud recording ID,
-and disconnects on the SDK owner loop.
+MindLink and Guardian. Practice uses `GuardianEEGFeatureSource` on the practice
+thread: health checks drain only through the current attempt cutoff, status uses
+an ordered replaceable window, and only finalized chronological samples reach
+the raw HDF5 recorder. Late callback blocks can therefore correct a still-open
+status window without being appended behind newer samples. Shutdown attempts
+Guardian recording stop, `drain_remaining()`, and Guardian close independently,
+captures the cloud recording ID, and disconnects on the SDK owner loop.
 
 The display includes recognized objects, a high-contrast labelled gaze bullseye,
 current gaze validity/coordinates, current candidate, fixed dwell,

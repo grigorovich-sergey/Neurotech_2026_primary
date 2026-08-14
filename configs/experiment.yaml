@@ -23,8 +23,9 @@ recording:
   eeg_enabled: true
 
 processing:
-  scene_queue_size: 4
+  scene_queue_size: 1
   gaze_queue_size: 4096
+  gaze_batch_size: 64
   reorder_hold_seconds: 0.05
   idle_sleep_seconds: 0.005
 
