@@ -16,10 +16,14 @@ from eeg_pipeline.guardian import (
     GuardianTimestampMapper,
 )
 from eeg_pipeline.pipeline import EEGPipeline
-from eeg_pipeline.processing import FEATURE_NAMES, EEGFeatureExtractor, EEGPreprocessor, EEGQualityGate
+from eeg_pipeline.processing import (
+    FEATURE_NAMES,
+    EEGFeatureExtractor,
+    EEGPreprocessor,
+    EEGQualityGate,
+)
 from eeg_pipeline.recording import EEGHDF5Recorder, EEGHDF5Replay
 from eeg_pipeline.synthetic import synthetic_eeg_samples
-
 
 SAMPLE_RATE = 250.0
 
@@ -67,8 +71,7 @@ def test_guardian_timestamp_mapping_and_live_event_conversion() -> None:
         1_700_000_000.008,
     ]
     assert [sample.host_receipt_timestamp for sample in samples] == [2.25, 2.25]
-    with pytest.raises(ValueError, match="backwards"):
-        mapper.map(1_700_000_000.006)
+    assert mapper.map(1_700_000_000.006) == pytest.approx(2.006, abs=1e-6)
     with pytest.raises(ValueError, match="precedes"):
         GuardianTimestampMapper(
             anchor_run_timestamp=0.0,
@@ -76,11 +79,37 @@ def test_guardian_timestamp_mapping_and_live_event_conversion() -> None:
         ).map(1_699_999_999.0)
 
 
-def test_guardian_persistent_lifecycle_preflights_before_recording_and_drains_causally(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    clock_values = iter((5.0, 5.25))
+def test_guardian_parser_accepts_blocks_received_out_of_timestamp_order() -> None:
+    mapper = GuardianTimestampMapper(
+        anchor_run_timestamp=2.0,
+        anchor_unix_timestamp=1_700_000_000.0,
+    )
+    samples: list[EEGSample] = []
+    parser = GuardianLiveParser(mapper, samples.append, lambda: 3.0)
 
+    parser(
+        {
+            "raw_eeg": [
+                {"timestamp": 1_700_000_000.020, "ch1": 5.0},
+                {"timestamp": 1_700_000_000.024, "ch1": 6.0},
+            ]
+        }
+    )
+    parser(
+        {
+            "raw_eeg": [
+                {"timestamp": 1_700_000_000.004, "ch1": 1.0},
+                {"timestamp": 1_700_000_000.008, "ch1": 2.0},
+            ]
+        }
+    )
+
+    assert [sample.timestamp for sample in samples] == pytest.approx(
+        [2.020, 2.024, 2.004, 2.008], abs=1e-6
+    )
+
+
+def test_guardian_persistent_lifecycle_preflights_before_recording_and_drains_causally() -> None:
     class FakeClient:
         def __init__(self) -> None:
             self.log: list[str] = []
@@ -117,11 +146,22 @@ def test_guardian_persistent_lifecycle_preflights_before_recording_and_drains_ca
             assert raw_eeg is True
             self.handler = handler
 
-        async def start_recording(self, *, recording_timer: int) -> str:
+        async def start_recording(
+            self, *, recording_timer: int, led_sleep: bool, calc_latency: bool
+        ) -> str:
             self.mark("record")
             assert recording_timer == 60
+            assert led_sleep is False
+            assert calc_latency is False
             assert self.handler is not None
-            self.handler({"raw_eeg": [{"timestamp": 1_700_000_000.004, "ch1": 4.5}]})
+            self.handler(
+                {
+                    "raw_eeg": [
+                        {"timestamp": 1_700_000_000.004, "ch1": 4.5},
+                        {"timestamp": 1_700_000_000.008, "ch1": 5.5},
+                    ]
+                }
+            )
             self.emitted.set()
             try:
                 await asyncio.Event().wait()
@@ -136,9 +176,8 @@ def test_guardian_persistent_lifecycle_preflights_before_recording_and_drains_ca
             self.mark("disconnect")
 
     client = FakeClient()
-    monkeypatch.setattr("eeg_pipeline.guardian.time.time", lambda: 1_700_000_000.0)
     adapter = GuardianAdapter(
-        clock=lambda: next(clock_values),
+        clock=lambda: 5.25,
         client_factory=lambda **_: client,
     )
 
@@ -154,14 +193,15 @@ def test_guardian_persistent_lifecycle_preflights_before_recording_and_drains_ca
 
     adapter.start(recording_seconds=60)
     assert client.emitted.wait(1.0)
-    assert adapter.drain(cutoff_timestamp=5.003) == ()
-    samples = adapter.drain(cutoff_timestamp=5.004)
+    assert adapter.drain(cutoff_timestamp=5.247) == ()
+    samples = adapter.drain(cutoff_timestamp=5.252)
     adapter.stop()
     adapter.close()
 
     assert adapter.mapper is not None
-    assert adapter.mapper.anchor_run_timestamp == 5.0
-    assert samples[0].timestamp == pytest.approx(5.004, abs=1e-6)
+    assert adapter.mapper.anchor_run_timestamp == pytest.approx(5.248, abs=1e-6)
+    assert samples[0].timestamp == pytest.approx(5.248, abs=1e-6)
+    assert samples[1].timestamp == pytest.approx(5.252, abs=1e-6)
     assert samples[0].host_receipt_timestamp == 5.25
     assert samples[0].value_uv == 4.5
     assert client.cleaned
@@ -191,7 +231,7 @@ def test_guardian_preflight_hard_gates_impedance_and_disconnects() -> None:
         def stop_impedance(self) -> None:
             self.impedance_running = False
 
-        async def start_recording(self, *, recording_timer: int) -> None:
+        async def start_recording(self, *, recording_timer: int, **_: object) -> None:
             self.recording_started = True
 
         async def disconnect_device(self) -> None:
@@ -224,7 +264,7 @@ def test_guardian_queue_overflow_is_a_hard_error(
         def subscribe_live_insights(self, *, raw_eeg: bool, handler) -> None:
             self.handler = handler
 
-        async def start_recording(self, *, recording_timer: int) -> str:
+        async def start_recording(self, *, recording_timer: int, **_: object) -> str:
             assert self.handler is not None
             self.handler(
                 {
@@ -273,7 +313,7 @@ def test_guardian_recording_failure_surfaces_on_integration_thread() -> None:
         def subscribe_live_insights(self, *, raw_eeg: bool, handler) -> None:
             pass
 
-        async def start_recording(self, *, recording_timer: int) -> None:
+        async def start_recording(self, *, recording_timer: int, **_: object) -> None:
             raise RuntimeError("recording failed")
 
         async def disconnect_device(self) -> None:
@@ -293,6 +333,132 @@ def test_guardian_recording_failure_surfaces_on_integration_thread() -> None:
         adapter.drain()
     with pytest.raises(RuntimeError, match="recording failed"):
         adapter.close()
+
+
+def test_guardian_separate_impedance_lifecycle_precedes_recording() -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.log: list[str] = []
+            self.impedance_running = False
+            self.handler = None
+
+        async def connect_device(self) -> None:
+            self.log.append("connect")
+
+        async def check_battery(self) -> int:
+            self.log.append("battery")
+            return 91
+
+        async def stream_impedance(self, *, mains_freq_60hz, handler) -> None:
+            self.log.append("impedance_start")
+            assert mains_freq_60hz is True
+            self.impedance_running = True
+            handler(11_500.0)
+            while self.impedance_running:
+                await asyncio.sleep(0)
+            self.log.append("impedance_stopped")
+
+        def stop_impedance(self) -> None:
+            self.impedance_running = False
+
+        def subscribe_live_insights(self, *, raw_eeg: bool, handler) -> None:
+            assert raw_eeg is True
+            self.handler = handler
+
+        async def start_recording(self, *, recording_timer: int, **_: object) -> str:
+            self.log.append("recording")
+            return "separate-lifecycle"
+
+        async def disconnect_device(self) -> None:
+            self.log.append("disconnect")
+
+    client = FakeClient()
+    adapter = GuardianAdapter(clock=lambda: 0.0, client_factory=lambda **_: client)
+
+    adapter.connect()
+    assert adapter.check_battery() == 91.0
+    adapter.start_impedance(mains_frequency_hz=60)
+    deadline = time.monotonic() + 1.0
+    while adapter.latest_impedance() is None and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert adapter.latest_impedance() == 11_500.0
+    adapter.stop_impedance()
+    adapter.start(recording_seconds=1)
+    deadline = time.monotonic() + 1.0
+    while not adapter.recording_done and time.monotonic() < deadline:
+        time.sleep(0.001)
+    adapter.stop()
+    adapter.disconnect()
+    adapter.close()
+
+    assert client.log == [
+        "connect",
+        "battery",
+        "impedance_start",
+        "impedance_stopped",
+        "recording",
+        "disconnect",
+    ]
+
+
+def test_guardian_window_marks_missing_then_accepts_late_overlapping_data() -> None:
+    adapter = GuardianAdapter(clock=lambda: 0.0, client_factory=lambda **_: object())
+    adapter._enqueue_samples(
+        (
+            EEGSample(0.0, 1.0),
+            EEGSample(0.004, 2.0),
+            EEGSample(0.012, 4.0),
+        )
+    )
+
+    first = adapter.window(0.0, 0.012)
+    assert [sample.timestamp for sample in first.samples] == [
+        0.0,
+        0.004,
+        0.008,
+        0.012,
+    ]
+    assert [sample.valid for sample in first.samples] == [True, True, False, True]
+
+    adapter._enqueue_samples((EEGSample(0.008, 3.0),))
+    updated = adapter.window(0.0, 0.012)
+    assert [sample.value_uv for sample in updated.samples] == [1.0, 2.0, 3.0, 4.0]
+    assert all(sample.valid for sample in updated.samples)
+
+    advanced = adapter.window(0.004, 0.016)
+    assert [sample.valid for sample in advanced.samples] == [True, True, True, False]
+    adapter._enqueue_samples((EEGSample(0.0, 99.0), EEGSample(0.016, 5.0)))
+    refreshed = adapter.window(0.004, 0.016)
+
+    assert [sample.value_uv for sample in refreshed.samples] == [2.0, 3.0, 4.0, 5.0]
+    assert all(sample.valid for sample in refreshed.samples)
+    assert adapter.lost_sample_count == 1
+    assert adapter.lost_block_count == 1
+
+
+def test_guardian_finalize_emits_missing_grid_and_rejects_expired_arrival() -> None:
+    adapter = GuardianAdapter(clock=lambda: 0.0, client_factory=lambda **_: object())
+    adapter._enqueue_samples((EEGSample(0.0, 1.0), EEGSample(0.008, 3.0)))
+
+    finalized = adapter.finalize_before(0.012)
+
+    assert [sample.timestamp for sample in finalized] == [0.0, 0.004, 0.008]
+    assert [sample.valid for sample in finalized] == [True, False, True]
+    adapter._enqueue_samples((EEGSample(0.004, 2.0),))
+    assert adapter.lost_sample_count == 1
+    with pytest.raises(ValueError, match="finalization boundaries"):
+        adapter.finalize_before(0.008)
+
+
+def test_pipeline_can_evaluate_replaceable_guardian_snapshot_without_ingest() -> None:
+    adapter = GuardianAdapter(clock=lambda: 0.0, client_factory=lambda **_: object())
+    adapter._enqueue_samples(tuple(_tone_samples(1.0)))
+    pipeline = _pipeline()
+
+    feature_window = pipeline.features_from_window(adapter.window(0.0, 1.0))
+
+    assert feature_window.quality_state is QualityState.USABLE
+    assert len(pipeline.buffer) == 0
 
 
 def test_window_is_closed_and_never_includes_sample_after_cutoff() -> None:

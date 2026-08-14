@@ -28,7 +28,13 @@ class EEGPipeline:
         return self.buffer.window(start, end)
 
     def features(self, start: float, end: float) -> EEGFeatureWindow:
-        window = self.window(start, end)
+        return self.features_from_window(self.window(start, end))
+
+    def features_from_window(self, window: EEGWindow) -> EEGFeatureWindow:
+        """Evaluate a raw snapshot without permanently appending it to the buffer."""
+
+        if not isinstance(window, EEGWindow):
+            raise TypeError("window must be an EEGWindow")
         quality_state, quality_reasons = self.quality_gate.evaluate(window)
         values = None
         if quality_state is QualityState.USABLE:

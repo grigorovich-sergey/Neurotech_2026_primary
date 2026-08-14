@@ -63,10 +63,10 @@ the run's saved resolved configuration.
 contains `timestamp`, `value_uv`, `valid`, `vendor_timestamp_unix`, and
 `host_receipt_timestamp` datasets plus `schema_version`, `sample_rate_hz`,
 `timebase=run_relative_seconds`, and `value_units=microvolts` metadata. A NaN in
-either diagnostic timestamp dataset means unavailable and replays as `None`;
-missing samples remain absent. `EEGHDF5Replay` reads both schema v2 and legacy
-schema v1, reconstructing ordered `EEGSample` values without inventing legacy
-timing metadata.
+either diagnostic timestamp dataset means unavailable and replays as `None`.
+Finalized live Guardian gaps are recorded as zero-valued samples with `valid=false`;
+replay preserves those explicit missing positions. `EEGHDF5Replay` also reads
+legacy schema v1 without inventing unavailable timing metadata.
 
 Run the hardware-independent default:
 
@@ -102,51 +102,74 @@ events, summaries, or terminal output.
 
 The adapter uses `idun-guardian-sdk==0.1.23` directly (no LSL). One persistent
 worker thread and asyncio loop own the SDK client from Bluetooth connection through
-disconnect. The explicit lifecycle is:
+disconnect. Connection, fitting diagnostics, and acquisition are separate:
 
 ```python
 adapter = GuardianAdapter(clock=attempt_clock.now, ...)
-preflight = adapter.prepare(...)
+adapter.connect()
+battery_percent = adapter.check_battery()
+adapter.start_impedance(mains_frequency_hz=60)
+impedance_ohms = adapter.latest_impedance()  # poll for the fitting display
+adapter.stop_impedance()
+
 # Start the shared attempt clock first.
 adapter.start(recording_seconds=...)
-samples = adapter.drain(cutoff_timestamp=cutoff)
+raw_window = adapter.window(start, end)
+stable_samples = adapter.finalize_before(next_window_start)
 adapter.stop()
-remaining = adapter.drain()
+adapter.disconnect()
 adapter.close()
 ```
 
-`prepare()` connects and reads battery plus the optional impedance hard gate but
-does not subscribe to or record raw EEG. `start()` subscribes to `raw_eeg` and
-captures a paired clock anchor only after the integration-owned attempt clock has
-started:
+`prepare()` remains a compatibility convenience that composes connection, battery,
+and a finite impedance hard gate. Neither preparation route subscribes to raw EEG.
+Impedance must be stopped before `start()`; `start()` subscribes only to raw EEG and
+calls the working SDK recording path with `led_sleep=False` and
+`calc_latency=False`.
+
+The first raw block establishes the clock mapping. Its final sample is aligned to
+the nearest 250 Hz point around that callback's host receipt time, then all vendor
+timestamps use the fixed transform:
 
 ```text
 run_timestamp = anchor_run + guardian_unix_timestamp - anchor_unix
 ```
 
 One host receipt timestamp is captured per SDK callback and attached to all raw
-samples in that callback. The standalone runner creates its own monotonic clock at
-recording start. Integrated live operation must instead pass the same deferred
-attempt-clock callable used by the other hardware adapters. Vendor timestamps
-remain the source of sensor sample time; callback order is not substituted for
-them. Backward or negative mapped timestamps remain hard errors.
+samples in that callback. Integrated live operation must pass the same deferred
+attempt-clock callable used by the other hardware adapters. Vendor timestamps,
+not callback order or the SDK `sequence` field, determine sample position. Whole
+callbacks may arrive out of timestamp order; timestamps moving backward inside one
+raw block and negative mapped timestamps remain hard errors.
 
 The default preflight uses the SDK impedance stream and requires the latest
 reading to be below the configured 300 kOhm threshold before recording. Battery is
 recorded as a diagnostic, not treated as a configurable scientific threshold.
 Realtime IDUN Quality Score predictions are not required.
 
-SDK callbacks append canonical `EEGSample` values to a bounded handoff queue.
-`drain(cutoff_timestamp=t)` returns only samples at or before the closed cutoff and
-leaves later samples queued. Instance 4 must drain immediately before each
-EEG-dependent prediction and ingest those samples into `EEGPipeline` on the
-integration thread. The SDK worker never writes HDF5 or mutates the pipeline.
-Queue overflow raises `GuardianQueueOverflowError` and stops acquisition instead
-of silently dropping scientifically relevant samples. The default capacity is
-15,000 samples (60 seconds at 250 Hz).
+The preferred consumer path is the mutable 250 Hz timestamp grid. `window(start,
+end)` returns the current closed snapshot in timestamp order. Positions whose
+packets have not arrived are explicit `EEGSample(value_uv=0.0, valid=False)` values.
+A late packet replaces those missing positions in a repeated or later overlapping
+request. Each new request start closes all earlier positions; a packet arriving
+behind that boundary is discarded and counted by `lost_sample_count` and
+`lost_block_count`. There is no fixed reordering delay and no assumption that SDK
+sequence numbers are contiguous.
+
+`finalize_before(t)` irreversibly returns the chronological grid strictly before
+`t`, including explicit invalid gaps, for append-only HDF5 persistence. Callers must
+finalize before advancing past data they need to save. `EEGPipeline.features_from_window()`
+evaluates a snapshot without mutating its append-only replay buffer. Asynchronous
+SDK and capacity failures are surfaced by `check_health()` and all data methods.
+
+The legacy `drain(cutoff_timestamp=...)` path remains for older standalone callers,
+but it is one-way and cannot be mixed with `window()`/`finalize_before()`. Capacity
+overflow raises `GuardianQueueOverflowError` instead of silently dropping data; the
+default capacity is 15,000 samples (60 seconds at 250 Hz).
 
 `stop()` cancels and awaits the SDK recording task, captures its cloud recording
-ID when available, and `close()` disconnects on the same SDK loop. The blocking
-`run()` method remains as a standalone compatibility wrapper. Live Guardian
-cancellation, timestamp units, and combined MindLink/Guardian timing still require
-pilot validation with physical hardware.
+ID when available. `disconnect()` releases BLE while keeping the owner loop alive;
+`close()` performs final cleanup and terminates that loop. The blocking `run()`
+method remains as a legacy compatibility wrapper. Live Guardian cancellation,
+timestamp units, impedance behavior, and combined MindLink/Guardian timing still
+require pilot validation with physical hardware.

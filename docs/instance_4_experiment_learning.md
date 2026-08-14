@@ -141,16 +141,20 @@ already accumulated on update N.
 ### Live Guardian feature source
 
 Live attempts should pass `GuardianEEGFeatureSource`, not a bare `EEGPipeline`, to
-`ExperimentController.evaluate_update(...)`. The source synchronously drains the
-merged persistent `GuardianAdapter` through the exact feature-window end, records
-and ingests only those samples on the caller's Integration thread, and then asks
-the unchanged pipeline for the closed feature window.
+`ExperimentController.evaluate_update(...)`. The source requests the adapter's
+current ordered snapshot for the exact closed interval and passes it to
+`EEGPipeline.features_from_window(...)`. It never appends provisional or replaceable
+samples to the pipeline's ordered replay buffer.
 
 ```python
 from experiment_learning.guardian_source import GuardianEEGFeatureSource
 
 guardian = GuardianAdapter(clock=attempt_clock.now, ...)
-guardian.prepare(...)  # before SPACE; raw EEG remains off
+guardian.connect()
+guardian.check_battery()
+guardian.start_impedance()
+# Poll guardian.latest_impedance() for fitting, then:
+guardian.stop_impedance()
 
 # At SPACE, start the shared attempt clock before raw EEG.
 attempt_clock.start()
@@ -162,29 +166,40 @@ eeg_source = GuardianEEGFeatureSource(
     recorder=eeg_recorder,
 )
 
-# Safe periodic ingestion at the latest processed scientific timestamp prevents
-# the bounded Guardian queue from filling during long periods without predictions.
+# Existing periodic calls remain the health/finalization hook. They retain the
+# newest 30 seconds so future feature windows can still accept late packets.
 eeg_source.drain_through(latest_processed_timestamp)
 ```
 
-`features(start, end)` always performs another
-`guardian.drain(cutoff_timestamp=end)` immediately before feature extraction. It
-fails loudly if the adapter returns any sample after `end`. Guardian acquisition
-failures, including queue overflow, propagate unchanged; they must fail the
-attempt rather than become missing EEG or a fabricated fallback.
+`features(start, end)` first checks Guardian health, finalizes and records data
+strictly before `start`, then obtains `guardian.window(start, end)`. Not-yet-arrived
+positions are explicit invalid samples, so the existing quality gate rejects that
+window without fabricating EEG evidence. Late packets may correct a subsequent
+overlapping request, but an already-frozen episode decision is never recomputed.
+The source default retention horizon is 30 seconds; requests older than finalized
+history fail explicitly.
+
+`drain_through(cutoff)` no longer means callback-order ingestion. It checks
+asynchronous acquisition health and incrementally records only samples older than
+`cutoff - retention_seconds`. This preserves the existing Integration hook without
+closing the recent mutable horizon. `drain_remaining()` finalizes through the last
+processed scientific cutoff after recording stops. Finalized gaps are written to
+raw HDF5 as `valid=false`. Acquisition, capacity, recorder, and cleanup failures
+remain hard attempt errors.
 
 Normal completion is ordered explicitly:
 
 ```python
 guardian.stop()
 eeg_source.drain_remaining()
+guardian.disconnect()
 guardian.close()
 ```
 
-Keep final drain and close in independent cleanup blocks so disconnect is still
-attempted if stop or drain fails. `recording_id`, battery, impedance, queue status,
-and source ingestion counters are diagnostics/provenance only and must not enter
-the engagement index or frozen policy.
+Keep stop, finalization, and close in independent cleanup blocks so disconnect is
+still attempted if an earlier step fails. `recording_id`, battery, impedance,
+capacity/loss status, and source finalization counters are diagnostics/provenance
+only and must not enter the engagement index or frozen policy.
 
 ### Core construction example
 
@@ -413,11 +428,11 @@ condition, calls `evaluate_update`, routes explicit action/no-action/feedback
 operations, applies typed cancellations, and trains only after successful closure.
 
 Live attempts use the persistent Guardian lifecycle and
-`GuardianEEGFeatureSource`: preflight precedes SPACE, the attempt clock starts
-before raw EEG, every feature request drains through its exact cutoff on the
-Integration thread, and stop/final-drain/close remain independent cleanup steps.
-The current runbook and failure semantics are documented in
-`docs/instance_5_integration.md`.
+`GuardianEEGFeatureSource`: fitting impedance precedes SPACE, the attempt clock
+starts before raw EEG, and every feature request evaluates a mutable ordered
+snapshot on the Integration thread. Instance 5 still needs its separately scoped
+orchestration update for gaze calibration -> live impedance -> SPACE -> recording;
+the experiment controller and predict-score-update order are unchanged.
 
 Instances 1–3 require no algorithm changes. `river==0.22.0` remains removed;
 existing NumPy and SciPy dependencies cover the corrected implementation.
