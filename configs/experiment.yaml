@@ -13,7 +13,7 @@ model_selection:
 
 session:
   id_prefix: experiment-session
-  maximum_duration_seconds: 600.0
+  maximum_duration_seconds: 300.0
 
 terminal:
   concise_decisions: true
@@ -30,7 +30,7 @@ processing:
   idle_sleep_seconds: 0.005
 
 feedback:
-  key_code: 32
+  key_code: 80
   stop_key_codes: [113, 27]
 
 display:

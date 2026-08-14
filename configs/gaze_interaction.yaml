@@ -27,12 +27,10 @@ detector:
         terms: [chair, armchair]
       - name: laptop
         terms: [laptop, notebook computer]
-      - name: cellphone
-        terms: [cell phone, cellphone, mobile phone, smartphone, smart phone]
-      - name: tablet
-        terms: [ipad, tablet, tablet computer]
-      - name: wall poster
-        terms: [wall poster, poster, placard]
+      - name: backpack
+        terms: [backpack, bag]
+      - name: person
+        terms: [person, human]
       - name: TV
         terms: [TV, television, TV screen]
       - name: mug

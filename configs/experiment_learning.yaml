@@ -15,8 +15,8 @@ timing:
   trajectory_step_s: 0.05
 
 cold_start_policy:
-  base_threshold_s: 1.0
-  minimum_e_threshold_s: 0.35
+  base_threshold_s: 3.0
+  minimum_e_threshold_s: 1
   base_search_min_s: 0.5
   base_search_max_s: 1.5
   base_search_step_s: 0.05
