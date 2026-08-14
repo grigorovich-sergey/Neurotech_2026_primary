@@ -154,7 +154,9 @@ The live lifecycle is intentionally strict:
 finite compatibility preflight. The schedule-backed Integration verifier has no
 MindLink input of its own. `scripts/run_experiment.py` now completes MindLink
 calibration before entering step 2 and uses this same causal EEG source;
-`run_practice_session.py --with-eeg` remains the non-experimental diagnostic path.
+`run_practice_session.py --with-eeg` remains the non-experimental diagnostic path
+and now uses the same `GuardianEEGFeatureSource` causal window/finalization rules;
+it no longer uses the legacy append-only `GuardianAdapter.drain()` path.
 See `docs/main_experiment_runner.md` for the live experimental lifecycle.
 
 `guardian.impedance.duration_seconds` remains in the shared EEG config for the

@@ -364,6 +364,7 @@ def _validate_config(
     processing = _mapping(config, "processing")
     _positive_int("processing.scene_queue_size", processing.get("scene_queue_size"))
     _positive_int("processing.gaze_queue_size", processing.get("gaze_queue_size"))
+    _positive_int("processing.gaze_batch_size", processing.get("gaze_batch_size"))
     hold = processing.get("reorder_hold_seconds")
     if (
         isinstance(hold, bool)
@@ -911,9 +912,12 @@ def run_live_experiment(
                 if now >= duration:
                     state.stop("duration_reached")
                     break
-                item = merger.pop_ready()
-                processed = item is not None
-                if item is not None:
+                processed = False
+                for _ in range(resolved["processing"]["gaze_batch_size"]):
+                    item = merger.pop_ready()
+                    if item is None:
+                        break
+                    processed = True
                     stream, sample = item
                     timestamp = float(sample.timestamp)
                     if timestamp + 1e-12 < orchestrator.latest_processed_scientific_timestamp:
@@ -937,10 +941,11 @@ def run_live_experiment(
                         assert isinstance(sample, SceneFrame)
                         latest_frame = sample
                         display.update_scene(sample, orchestrator.process_scene(sample))
+                        break
                     else:
                         assert isinstance(sample, GazeSample)
                         display.update_gaze(orchestrator.process_gaze(sample))
-                else:
+                if not processed:
                     eeg_source.drain_through(
                         orchestrator.latest_processed_scientific_timestamp
                     )
