@@ -19,17 +19,20 @@ terminal:
   concise_decisions: true
 
 recording:
-  glasses_enabled: true
+  # Raw scene/gaze HDF5 is deliberately opt-in because it makes the current
+  # live experiment FPS unmanageable. The CLI can enable it with --record-glasses.
+  glasses_enabled: false
   eeg_enabled: true
 
 processing:
   scene_queue_size: 1
   gaze_queue_size: 4096
   gaze_batch_size: 64
-  reorder_hold_seconds: 0.05
   idle_sleep_seconds: 0.005
 
 feedback:
+  # Provisional until scripts/check_feedback_key.py is run with the actual HUD
+  # presenter on the experiment computer. Extended OpenCV key codes are backend-specific.
   key_code: 80
   stop_key_codes: [113, 27]
 
@@ -37,6 +40,7 @@ display:
   enabled: true
   window_name: NeuroTech experiment
   selection_banner_seconds: 1.0
+  feedback_banner_seconds: 0.5
   no_frame_warning_seconds: 3.0
 
 diagnostics:

@@ -62,17 +62,19 @@ evidence = max(0, 2 * P_EEG - 1)
 T_E = max(minimum_E, T_G * (1 - reduction_fraction * evidence))
 ```
 
-With `T_G=1.0`, `reduction_fraction=0.4`, and `minimum_E=0.35`:
+The current experiment cold standard is `T_G=3.0` with a hard
+`minimum_E=1.0`. The configured maximum reduction is `2/3`:
 
-| `P_EEG` | Evidence | E dwell |
+| `P_EEG` | Evidence | E dwell at 2/3 reduction |
 | ---: | ---: | ---: |
-| 0.30 | 0.00 | 1.00 s |
-| 0.50 | 0.00 | 1.00 s |
-| 0.75 | 0.50 | 0.80 s |
-| 1.00 | 1.00 | 0.60 s |
+| 0.30 | 0.00 | 3.00 s |
+| 0.50 | 0.00 | 3.00 s |
+| 0.75 | 0.50 | 2.00 s |
+| 1.00 | 1.00 | 1.00 s |
 
 Session 1 sets the reduction to zero, so G and E behave identically before any
-participant data exist.
+participant data exist. Between-session G candidates currently span 2.0--4.0 s
+in 0.05 s steps; the E floor remains 1.0 s.
 
 ## Predetermined condition schedule
 

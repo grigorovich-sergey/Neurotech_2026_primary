@@ -205,12 +205,33 @@ class DwellController:
         )
 
     def _cancel(self, timestamp: float) -> tuple[DwellState, bool]:
-        """Clear dwell state and report whether a pending trigger was discarded."""
+        """Clear dwell state without moving scientific time backwards."""
+
+        timestamp_value = float(timestamp)
+
+        if not math.isfinite(timestamp_value) or timestamp_value < 0.0:
+            raise ValueError("timestamp must be finite and non-negative")
+
+        # Feedback/key timestamps can be captured a few microseconds before
+        # gaze samples that have already been processed. Cancellation is an
+        # external interruption, so clamp it to the latest dwell update.
+        if self._last_update_timestamp is not None:
+            timestamp_value = max(
+                timestamp_value,
+                self._last_update_timestamp,
+            )
 
         discarded_pending_trigger = self._trigger_pending
-        state, trigger = self.advance(None, matched=False, timestamp=timestamp)
+
+        state, trigger = self.advance(
+            None,
+            matched=False,
+            timestamp=timestamp_value,
+        )
+
         if trigger is not None:
             raise RuntimeError("dwell cancellation cannot emit a trigger")
+
         return state, discarded_pending_trigger
 
     def _reset_episode(self) -> None:

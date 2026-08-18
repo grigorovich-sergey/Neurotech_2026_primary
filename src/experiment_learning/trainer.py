@@ -49,6 +49,7 @@ class TrainerConfig:
     false_positive_weight: float = 2.0
     false_negative_weight: float = 1.0
     true_positive_latency_weight: float = 0.25
+    base_increase_penalty_weight: float = 0.0
     optimizer_max_iterations: int = 1000
     optimizer_ftol: float = 1e-12
 
@@ -67,6 +68,7 @@ class TrainerConfig:
             "false_positive_weight",
             "false_negative_weight",
             "true_positive_latency_weight",
+            "base_increase_penalty_weight",
             "optimizer_ftol",
         ):
             value = _finite(name, getattr(self, name))
@@ -86,8 +88,8 @@ class TrainerConfig:
         if not isinstance(self.reduction_values, tuple) or not self.reduction_values:
             raise ValueError("reduction_values must be a non-empty tuple")
         reductions = tuple(_finite("reduction value", item) for item in self.reduction_values)
-        if any(not 0.0 <= item <= 0.5 for item in reductions):
-            raise ValueError("reduction values must be within the approved [0, 0.5] bound")
+        if any(not 0.0 <= item <= 2.0 / 3.0 for item in reductions):
+            raise ValueError("reduction values must be within the configured [0, 2/3] bound")
         if tuple(sorted(set(reductions))) != reductions:
             raise ValueError("reduction_values must be unique and increasing")
         object.__setattr__(self, "reduction_values", reductions)
@@ -108,6 +110,7 @@ class TrainerConfig:
             false_positive_weight=objective["false_positive_weight"],
             false_negative_weight=objective["false_negative_weight"],
             true_positive_latency_weight=objective["true_positive_latency_weight"],
+            base_increase_penalty_weight=objective["base_increase_penalty_weight"],
             optimizer_max_iterations=optimizer["max_iterations"],
             optimizer_ftol=optimizer["ftol"],
         )
@@ -316,14 +319,29 @@ def _choose_base(
     table: list[dict[str, Any]] = []
     for threshold in _base_candidates(config):
         metrics = _candidate_metrics(records, [threshold] * len(records), config)
-        table.append({"base_threshold_s": threshold, **metrics})
+        base_increase_s = max(0.0, threshold - prior.g_base_threshold_s)
+        base_increase_penalty = config.base_increase_penalty_weight * base_increase_s
+        selection_loss = (
+            metrics["weighted_loss"] + base_increase_penalty
+            if metrics["weighted_loss"] is not None
+            else None
+        )
+        table.append(
+            {
+                "base_threshold_s": threshold,
+                **metrics,
+                "base_increase_from_prior_s": base_increase_s,
+                "base_increase_penalty": base_increase_penalty,
+                "selection_loss": selection_loss,
+            }
+        )
     valid = [row for row in table if row["valid"]]
     if not valid:
         return None
     chosen = min(
         valid,
         key=lambda row: (
-            row["weighted_loss"],
+            row["selection_loss"],
             row["false_positives"],
             row["false_negatives"],
             row["mean_true_positive_latency_s"],
@@ -556,10 +574,15 @@ def train_next_session_policy(
         },
         "optimizer": optimizer_report,
         "objective": {
-            "formula": "false_positive_weight * FP + false_negative_weight * FN + true_positive_latency_weight * mean_TP_latency_s",
+            "formula": (
+                "false_positive_weight * FP + false_negative_weight * FN + "
+                "true_positive_latency_weight * mean_TP_latency_s + "
+                "base_increase_penalty_weight * max(0, candidate_G_s - prior_G_s)"
+            ),
             "false_positive_weight": config.false_positive_weight,
             "false_negative_weight": config.false_negative_weight,
             "true_positive_latency_weight": config.true_positive_latency_weight,
+            "base_increase_penalty_weight": config.base_increase_penalty_weight,
         },
         "base_candidates": base_table,
         "reduction_candidates": reduction_table,
@@ -568,7 +591,7 @@ def train_next_session_policy(
             "maximum_eeg_reduction_fraction": reduction,
         },
         "tie_break_order": [
-            "lower_weighted_loss",
+            "lower_penalized_selection_loss",
             "fewer_false_positives",
             "fewer_false_negatives",
             "lower_true_positive_latency",

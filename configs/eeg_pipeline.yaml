@@ -25,7 +25,7 @@ source:
       # Used only by the finite prepare()/standalone compatibility workflow.
       # Live Integration/practice fitting continues until the operator gate.
       duration_seconds: 2.0
-      max_ohms: 3000000.0
+      max_ohms: 300000.0
       mains_frequency_hz: 60
 
 signal:

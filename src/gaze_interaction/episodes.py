@@ -158,9 +158,22 @@ class EpisodeTracker:
                 "cancellation reason must be feedback_interruption or "
                 "session_duration_reached"
             )
-        timestamp_value = self._check_order(timestamp)
+        timestamp_value = _valid_timestamp("timestamp", timestamp)
+
+        # External cancellation (e.g. feedback) can be timestamped a few
+        # milliseconds behind gaze that has already been processed.
+        # Never move the episode state backwards in scientific time.
+        if self._last_update_timestamp is not None:
+            timestamp_value = max(
+                timestamp_value,
+                self._last_update_timestamp,
+            )
+
+        self._last_update_timestamp = timestamp_value
+
         if self._active is None:
             return None
+
         return self._end_active(timestamp_value, reason)
 
     def _check_order(self, timestamp: float) -> float:

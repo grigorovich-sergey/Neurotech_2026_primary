@@ -1,6 +1,6 @@
-"""Practice-style live experiment fallback.
+"""Authoritative practice-style live experiment runner.
 
-This is a standalone alternative to ``integration.live_workflow``.  It keeps
+This is the hardware-tested live path. It keeps
 the participant/session/learning contracts of the main experiment, but copies
 the acquisition and display cadence that has proved responsive in
 ``run_practice_session``:
@@ -13,9 +13,10 @@ the acquisition and display cadence that has proved responsive in
   ``--record-glasses``); and
 * a detailed practice-like diagnostic overlay.
 
-Run this file from the repository root.  It intentionally favors live
+Run this file from the repository root. It intentionally favors live
 responsiveness over the strict lossless/cross-stream reordering guarantees of
-the production runner.  EEG, model prediction, scoring, feedback, session
+``integration.live_workflow``, which is retained as the strict reference path.
+EEG, model prediction, scoring, feedback, session
 completion, and training advancement still use the normal experiment modules.
 """
 
@@ -453,8 +454,8 @@ class _OperatorKeys:
         if self.injected is not None:
             return int(self.injected())
         if self.window_enabled:
-            key = cv2.waitKey(1) & 0xFF
-            if key != 255:
+            key = cv2.waitKeyEx(1)
+            if key >= 0:
                 return key
         if os.name == "nt":
             import msvcrt
@@ -488,6 +489,7 @@ class _LiveDisplay:
         self.enabled = bool(config["enabled"])
         self.window_name = config["window_name"]
         self.selection_banner_seconds = float(config["selection_banner_seconds"])
+        self.feedback_banner_seconds = float(config["feedback_banner_seconds"])
         self.clock = clock
         self.terminal = terminal
         self.status_lines = status_lines
@@ -499,6 +501,7 @@ class _LiveDisplay:
         self.decision_reason: str | None = None
         self.selection_label: str | None = None
         self.selection_until = 0.0
+        self.feedback_until = 0.0
         self.opened = False
 
     def open(self) -> None:
@@ -537,6 +540,9 @@ class _LiveDisplay:
         )
         return presented
 
+    def mark_feedback(self) -> None:
+        self.feedback_until = self.clock() + self.feedback_banner_seconds
+
     def render(self) -> None:
         if not self.enabled or self.frame is None:
             return
@@ -558,6 +564,17 @@ class _LiveDisplay:
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
                 (255, 215, 0),
+                2,
+                cv2.LINE_AA,
+            )
+        if self.clock() <= self.feedback_until:
+            cv2.putText(
+                image,
+                "FEEDBACK BUTTON PRESSED",
+                (8, max(24, image.shape[0] - 50)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
                 2,
                 cv2.LINE_AA,
             )
@@ -670,14 +687,6 @@ def _validate_config(
     _positive_int("processing.scene_queue_size", processing.get("scene_queue_size"))
     _positive_int("processing.gaze_queue_size", processing.get("gaze_queue_size"))
     _positive_int("processing.gaze_batch_size", processing.get("gaze_batch_size"))
-    hold = processing.get("reorder_hold_seconds")
-    if (
-        isinstance(hold, bool)
-        or not isinstance(hold, (int, float))
-        or not math.isfinite(float(hold))
-        or hold < 0
-    ):
-        raise ValueError("processing.reorder_hold_seconds must be finite and non-negative")
     _positive_number("processing.idle_sleep_seconds", processing.get("idle_sleep_seconds"))
     recording = _mapping(config, "recording")
     if not isinstance(recording.get("glasses_enabled"), bool):
@@ -690,11 +699,12 @@ def _validate_config(
     if not isinstance(display.get("window_name"), str) or not display["window_name"]:
         raise ValueError("display.window_name must be non-empty")
     _positive_number("display.selection_banner_seconds", display.get("selection_banner_seconds"))
+    _positive_number("display.feedback_banner_seconds", display.get("feedback_banner_seconds"))
     _positive_number("display.no_frame_warning_seconds", display.get("no_frame_warning_seconds"))
     feedback = _mapping(config, "feedback")
     key = feedback.get("key_code")
-    if isinstance(key, bool) or not isinstance(key, int) or not 0 <= key <= 255:
-        raise ValueError("feedback.key_code must be an integer within [0, 255]")
+    if isinstance(key, bool) or not isinstance(key, int) or key < 0:
+        raise ValueError("feedback.key_code must be a non-negative integer")
     stop_keys = feedback.get("stop_key_codes")
     if not isinstance(stop_keys, list) or not stop_keys or any(
         isinstance(item, bool) or not isinstance(item, int) or not 0 <= item <= 255
@@ -1035,7 +1045,7 @@ def run_live_experiment(
                 f"{getattr(guardian, 'lost_sample_count', 0)} | "
                 f"battery {'--' if battery_percent is None else f'{battery_percent:.0f}%'}"
             )
-        lines.append("SPACE: feedback | Q/Esc: terminate")
+        lines.append("PRESENTER: feedback | Q/Esc: terminate")
         return lines
 
     display: _LiveDisplay | None = _LiveDisplay(
@@ -1053,6 +1063,7 @@ def run_live_experiment(
             return
         if key == resolved["feedback"]["key_code"]:
             feedback.submit_press(timestamp)
+            display.mark_feedback()
         elif key in resolved["feedback"]["stop_key_codes"] or key == 3:
             state.stop("operator_terminated")
 
@@ -1328,7 +1339,10 @@ def run_live_experiment(
                     },
                 )
             )
-            terminal(started_at, "session started; SPACE gives feedback, Q or Esc terminates")
+            terminal(
+                started_at,
+                "session started; presenter gives feedback, Q or Esc terminates",
+            )
             warned_no_frame = False
 
             def take_practice_batch(*, drain_all_gaze: bool = False) -> list[tuple[str, Any]]:
@@ -1401,7 +1415,9 @@ def run_live_experiment(
                         orchestrator.latest_processed_scientific_timestamp
                     )
                     if scene_queue.empty() and gaze_queue.empty():
-                        orchestrator.advance_time(now)
+                        orchestrator.advance_time(
+                            orchestrator.latest_processed_scientific_timestamp
+                        )
                 if guardian.recording_done and now < duration - 1e-9:
                     raise RuntimeError("Guardian recording ended before the session deadline")
                 display.render()
