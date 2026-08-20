@@ -336,6 +336,23 @@ class _LiveDiagnostics:
             }
 
 
+def _play_selection_beep() -> None:
+    """Best-effort, non-critical audio cue for selections."""
+    try:
+        if sys.platform == "win32":
+            import winsound
+
+            winsound.PlaySound(
+                "SystemAsterisk",
+                winsound.SND_ALIAS | winsound.SND_ASYNC,
+            )
+        else:
+            sys.stdout.write("\a")
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def _overlay_status(image_rgb: Any, lines: list[str]) -> Any:
     """Draw a readable practice-style status panel without resizing the frame."""
 
@@ -533,6 +550,8 @@ class _LiveDisplay:
         self.gaze = interaction.gaze
         self.interaction = interaction
         self.render()
+        if self.enabled:
+            _play_selection_beep()
         presented = max(float(trigger.timestamp), self.clock())
         self.terminal(
             presented,
