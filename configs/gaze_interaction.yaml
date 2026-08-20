@@ -28,13 +28,19 @@ detector:
       - name: laptop
         terms: [laptop, notebook computer]
       - name: backpack
-        terms: [backpack, bag]
-      - name: person
-        terms: [person, human]
+        terms: [backpack, duffel]
       - name: TV
         terms: [TV, television, TV screen]
       - name: mug
         terms: [mug, coffe cup, cup, teacup]
+      - name: poster
+        terms: [poster, media, news, flipchart, printed page, calendar]
+      - name: table
+        terms: [dining table, table]
+      - name: handbag
+        terms: [handbag, bag]
+      - name: box
+        terms: [box, storage box, container box, safe, container]
 
 tracker:
   activation_threshold: 0.25

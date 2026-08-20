@@ -157,6 +157,10 @@ def _config(tmp_path: Path, subject: str, active: str = "G") -> dict:
     config["session"]["maximum_duration_seconds"] = 0.08
     config["processing"]["reorder_hold_seconds"] = 0.0
     config["processing"]["idle_sleep_seconds"] = 0.001
+    config["recording"]["glasses_enabled"] = True
+    
+    config["feedback"]["key_code"] = 80
+    
     config["display"]["enabled"] = False
     config["diagnostics"]["write_mindlink_metadata"] = False
     return config

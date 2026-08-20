@@ -3,6 +3,10 @@ source:
   mode: live
   guardian:
     recording_seconds: 36000
+    impedance:
+      # Temporary live-lab fitting threshold. Keep the authoritative EEG
+      # default at 300 kOhm and remove this override when fitting permits.
+      max_ohms: 3000000.0
 
 window:
   start_seconds: 0.0

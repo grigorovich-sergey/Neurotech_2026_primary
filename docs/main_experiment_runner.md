@@ -2,8 +2,13 @@
 
 `scripts/run_experiment.py` runs one live participant-specific experimental
 session. It combines MindLink calibration/capture, Guardian fitting and raw EEG,
-gaze interaction, the frozen G/E policy, contextual feedback, replay artifacts,
-between-session training, and participant metrics.
+gaze interaction, the frozen G/E policy, contextual feedback, optional visual
+replay artifacts, between-session training, and participant metrics.
+
+This practice-style runner is the authoritative live path because it has been
+tested and troubleshot on the experiment hardware. `integration.live_workflow`
+retains the older strict global-timestamp-merger implementation as a reference
+path; it is not the live acquisition path.
 
 ## Invocation
 
@@ -60,39 +65,49 @@ Q, Esc, or Ctrl-C before SPACE aborts setup without an assignment, experiment
 recording, or completed session. Guardian `stop()`, EEG `drain_remaining()`, and
 Guardian `close()` are independent cleanup operations.
 
+The 3 MOhm impedance limit in `configs/practice_eeg.yaml` is a temporary live-lab
+fitting override. The authoritative EEG-pipeline default remains 300 kOhm.
+
 ## Live ordering and visible actions
 
-MindLink callbacks only enqueue canonical values. The Integration thread performs
-HDF5 recording and scientific processing. A configurable bounded reorder hold
-merges scene and gaze timestamps before they reach the orchestrator.
+MindLink callbacks enqueue canonical values into a latest-scene queue and a
+bounded latest-gaze queue. Raw glasses HDF5 is disabled by default because it
+reduces live FPS below a usable level; pass `--record-glasses` only when visual
+replay provenance is specifically required. Finalized EEG is persisted
+asynchronously in HDF5 batches.
 
-- Scene frames are latest-value data. Their configured bound applies across both
-  the callback queue and timestamp-merger heap, so slow detector inference cannot
-  accumulate an unbounded stale-scene backlog. Superseded scenes are dropped
-  explicitly in `events.jsonl`.
-- A late scene is dropped explicitly rather than moving scientific time backward.
-- Gaze queue overflow, late gaze, acquisition failure, Guardian overflow, and
-  recording failure are hard attempt errors. Gaze is never silently dropped.
-- Up to `processing.gaze_batch_size` ordered inputs are processed before one UI
-  render/key-poll cycle, matching the responsive practice scheduling pattern.
-  Processing stops after a scene inference so consecutive expensive detector
-  calls cannot starve gaze and UI work.
+- Scene and gaze queue overflow drops the oldest queued value and records the drop
+  explicitly in `events.jsonl`; this is an intentional responsiveness tradeoff.
+- Each live loop consumes at most one scene and up to
+  `processing.gaze_batch_size` gaze samples, sorting only that small batch by
+  timestamp. There is no global timestamp merger on the live path.
+- Samples that arrive behind already-processed scientific time are dropped and
+  logged rather than moving the experiment clock backward.
 - EEG drains only through the latest processed scientific timestamp. Exact
   feature requests retain PR #20's causal Guardian-window behavior.
 
 The dwell crossing and visible presentation are separate events. A trigger records
 its threshold-crossing timestamp. The selection is rendered/reported, the actual
 presentation timestamp is recorded, and the feedback window opens from
-presentation time. The participant display never identifies the active model.
+presentation time.
 
-SPACE is the contextual feedback button after start. Silence and presses retain
-the approved one-button truth table. Q or Esc ends an attempt without creating a
+The diagnostic OpenCV window is operator-only and may show active/shadow
+condition, intent score, decision reason, queue/drop counters, and EEG state.
+Participants cannot see it.
+
+The HUD laser presenter Down/PageDown button is the contextual feedback input
+after start. OpenCV extended-key codes are backend-specific, so run
+`python scripts/check_feedback_key.py` on the experiment computer with the actual
+presenter, then copy the measured value into `feedback.key_code`. A short
+`FEEDBACK BUTTON PRESSED` marker appears on the operator overlay whenever the
+configured feedback key is recognized. Silence and presses retain the approved
+one-button truth table. Q or Esc ends an attempt without creating a
 completed-session trainer input.
 
 ## Completion and retry rules
 
 Experiments are sequential; no concurrent participant-session machinery is used.
-Reaching `session.maximum_duration_seconds` (600 seconds by default) is the normal
+Reaching `session.maximum_duration_seconds` (300 seconds by default) is the normal
 successful endpoint. The active episode is canceled at the deadline and an
 already-open feedback window receives its remaining real grace period.
 
@@ -115,7 +130,7 @@ writes a carried-forward next policy and records that status.
 runs/subjects/<subject-id>/
   attempts/<attempt-id>/
     events.jsonl
-    raw_glasses.h5
+    raw_glasses.h5                       # only with --record-glasses
     raw_eeg.h5
     completed_session.json              # successful attempts only
     analysis_summary.json
