@@ -10,7 +10,7 @@ timing:
   minimum_prediction_elapsed_s: 0.25
   eeg_window_s: 1.0
   feedback_timeout_s: 2.0
-  episode_spacing_s: 3.0
+  episode_spacing_s: 3.5
   button_delay_s: 0.2
   trajectory_step_s: 0.05
 

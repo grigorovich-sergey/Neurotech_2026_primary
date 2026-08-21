@@ -1,9 +1,6 @@
-"""Authoritative practice-style live experiment runner.
+"""Run one live participant session through the authoritative experiment path.
 
-This is the hardware-tested live path. It keeps
-the participant/session/learning contracts of the main experiment, but copies
-the acquisition and display cadence that has proved responsive in
-``run_practice_session``:
+The acquisition and display cadence matches ``run_practice_session``:
 
 * latest-only scene and bounded latest-gaze queues;
 * one scene inference followed by a gaze batch and one render per loop;
@@ -13,11 +10,8 @@ the acquisition and display cadence that has proved responsive in
   ``--record-glasses``); and
 * a detailed practice-like diagnostic overlay.
 
-Run this file from the repository root. It intentionally favors live
-responsiveness over the strict lossless/cross-stream reordering guarantees of
-``integration.live_workflow``, which is retained as the strict reference path.
-EEG, model prediction, scoring, feedback, session
-completion, and training advancement still use the normal experiment modules.
+Run this file from the repository root. EEG, model prediction, scoring, feedback,
+session completion, and training advancement use the shared experiment modules.
 """
 
 from __future__ import annotations
@@ -1580,19 +1574,12 @@ def run_live_experiment(
                 binding.lineage_directory
                 / f"completed_session_{binding.session_number:03d}.json"
             )
-            participant_digest = save_completed_session(
-                participant_completed_path, completed
-            )
-            if run_digest != participant_digest:
-                raise RuntimeError("run and participant completed-session artifacts differ")
             next_policy_path = (
                 binding.lineage_directory
                 / f"policy_session_{binding.session_number + 1:03d}.json"
             )
-            published_policy_digest = immutable_write_json(
-                next_policy_path, load_json_object(staged_policy_path)
-            )
-            if published_policy_digest != training.policy_sha256:
+            staged_policy_payload = load_json_object(staged_policy_path)
+            if artifact_digest(staged_policy_payload) != training.policy_sha256:
                 raise RuntimeError("staged and participant policy artifacts differ")
             staged_report_path = staged_policy_path.with_name(
                 staged_policy_path.stem + ".training_report.json"
@@ -1600,41 +1587,31 @@ def run_live_experiment(
             participant_report_path = next_policy_path.with_name(
                 next_policy_path.stem + ".training_report.json"
             )
-            immutable_write_json(
-                participant_report_path, load_json_object(staged_report_path)
-            )
-            generate_participant_analysis(
-                (*binding.completed_paths, participant_completed_path),
-                binding.lineage_directory,
-            )
+            staged_report_payload = load_json_object(staged_report_path)
+            if next_policy_path.exists() and artifact_digest(
+                load_json_object(next_policy_path)
+            ) != training.policy_sha256:
+                raise FileExistsError(
+                    f"conflicting uncommitted next policy: {next_policy_path}"
+                )
+            if participant_report_path.exists() and artifact_digest(
+                load_json_object(participant_report_path)
+            ) != artifact_digest(staged_report_payload):
+                raise FileExistsError(
+                    f"conflicting uncommitted training report: {participant_report_path}"
+                )
             summary.update(
                 {
-                    "completed_session_sha256": participant_digest,
+                    "completed_session_sha256": run_digest,
                     "next_policy_path": str(next_policy_path),
-                    "next_policy_sha256": published_policy_digest,
+                    "next_policy_sha256": training.policy_sha256,
                     "training_status": training.report["status"],
                 }
             )
-            events.log(
-                Event(
-                    completed_timestamp,
-                    "experiment_session_completed",
-                    {
-                        "participant_id": subject_id,
-                        "session_number": binding.session_number,
-                        "attempt_id": attempt_id,
-                        "active_condition": active.value,
-                        "shadow_condition": binding.assignment.shadow_condition.value,
-                        "model_selection_source": "cli",
-                        "next_policy_sha256": published_policy_digest,
-                        "training_status": training.report["status"],
-                    },
-                )
-            )
-            terminal(
-                completed_timestamp,
-                f"session {binding.session_number} completed and trained",
-            )
+            # This immutable lineage artifact is the session-advance commit marker.
+            # The policy and report were validated locally; their deterministic
+            # lineage copies are recoverable from this completed-session input.
+            save_completed_session(participant_completed_path, completed)
         except BaseException as exc:
             fail("session_finalization", exc)
             successful = False
@@ -1642,6 +1619,64 @@ def run_live_experiment(
             summary["completed_timestamp"] = None
             summary["error"] = type(exc).__name__
             summary["stop_reason"] = "session_finalization"
+        else:
+            post_commit_warnings: list[dict[str, str]] = []
+            report_published = False
+            try:
+                immutable_write_json(participant_report_path, staged_report_payload)
+                report_published = True
+            except BaseException as exc:
+                post_commit_warnings.append(
+                    {"operation": "next_training_report", "error": type(exc).__name__}
+                )
+            if report_published:
+                try:
+                    immutable_write_json(next_policy_path, staged_policy_payload)
+                except BaseException as exc:
+                    post_commit_warnings.append(
+                        {"operation": "next_policy", "error": type(exc).__name__}
+                    )
+            try:
+                generate_participant_analysis(
+                    (*binding.completed_paths, participant_completed_path),
+                    binding.lineage_directory,
+                )
+            except BaseException as exc:
+                post_commit_warnings.append(
+                    {"operation": "participant_analysis", "error": type(exc).__name__}
+                )
+            try:
+                events.log(
+                    Event(
+                        completed_timestamp,
+                        "experiment_session_completed",
+                        {
+                            "participant_id": subject_id,
+                            "session_number": binding.session_number,
+                            "attempt_id": attempt_id,
+                            "active_condition": active.value,
+                            "shadow_condition": binding.assignment.shadow_condition.value,
+                            "model_selection_source": "cli",
+                            "next_policy_sha256": training.policy_sha256,
+                            "training_status": training.report["status"],
+                        },
+                    )
+                )
+            except BaseException as exc:
+                post_commit_warnings.append(
+                    {"operation": "completion_event", "error": type(exc).__name__}
+                )
+            try:
+                terminal(
+                    completed_timestamp,
+                    f"session {binding.session_number} completed and trained",
+                )
+            except BaseException as exc:
+                post_commit_warnings.append(
+                    {"operation": "completion_terminal", "error": type(exc).__name__}
+                )
+            if post_commit_warnings:
+                summary["post_commit_warnings"] = post_commit_warnings
     if not successful:
         events.log(
             Event(

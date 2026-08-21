@@ -14,10 +14,10 @@ from experiment_learning.assignment import (
 from experiment_learning.contracts import Condition
 from foundations.config import load_resolved_config
 from foundations.contracts import GazeSample, SceneFrame
-from foundations.events import JsonlEventLogger
 from gaze_interaction.contracts import BoundingBox, Detection, TrackedObject, TrackedScene
-from integration.live_input import LiveInputMerger
-from integration.live_workflow import run_live_experiment
+from scripts import run_experiment as experiment_runner
+from scripts.report_triggered_events import build_summary as build_triggered_summary
+from summarize_session import build_summary as build_session_summary
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -155,19 +155,16 @@ def _config(tmp_path: Path, subject: str, active: str = "G") -> dict:
     config["runtime"]["subject_id"] = subject
     config["runtime"]["active_model"] = active
     config["session"]["maximum_duration_seconds"] = 0.08
-    config["processing"]["reorder_hold_seconds"] = 0.0
     config["processing"]["idle_sleep_seconds"] = 0.001
     config["recording"]["glasses_enabled"] = True
-    
     config["feedback"]["key_code"] = 80
-    
     config["display"]["enabled"] = False
     config["diagnostics"]["write_mindlink_metadata"] = False
     return config
 
 
 def _run(config: dict, *, start: bool = True, poll_key=lambda: -1) -> Path:
-    return run_live_experiment(
+    return experiment_runner.run_live_experiment(
         config,
         detector=_Detector(),
         tracker=_Tracker(),
@@ -190,48 +187,6 @@ def test_cli_assignment_derives_shadow_and_round_trips(tmp_path: Path) -> None:
 
     save_model_assignment(path, assignment)
     assert load_model_assignment(path) == assignment
-
-
-def test_live_input_merger_orders_streams_and_makes_gaze_overflow_hard(
-    tmp_path: Path,
-) -> None:
-    failures: list[tuple[str, BaseException]] = []
-    now = [0.0]
-    merger = LiveInputMerger(
-        scene_queue_size=2,
-        gaze_queue_size=1,
-        reorder_hold_seconds=1.0,
-        event_logger=JsonlEventLogger(tmp_path / "events.jsonl"),
-        failure_callback=lambda source, error: failures.append((source, error)),
-        monotonic=lambda: now[0],
-    )
-    frame = SceneFrame(0.0, np.zeros((2, 2, 3), dtype=np.uint8))
-    merger.on_gaze(GazeSample(0.1, 0.5, 0.5, True, 1.0))
-    merger.on_scene(frame)
-    assert merger.pop_ready() == ("scene", frame)
-    merger.on_gaze(GazeSample(0.2, 0.5, 0.5, True, 1.0))
-    merger.on_gaze(GazeSample(0.3, 0.5, 0.5, True, 1.0))
-    assert failures[-1][0] == "mindlink_gaze_queue_overflow"
-
-
-def test_live_input_merger_bounds_scenes_after_callback_drain(tmp_path: Path) -> None:
-    merger = LiveInputMerger(
-        scene_queue_size=1,
-        gaze_queue_size=8,
-        reorder_hold_seconds=0.0,
-        event_logger=JsonlEventLogger(tmp_path / "events.jsonl"),
-        failure_callback=lambda source, error: pytest.fail(f"{source}: {error}"),
-    )
-    first = SceneFrame(1.0, np.zeros((2, 2, 3), dtype=np.uint8))
-    newest = SceneFrame(2.0, np.ones((2, 2, 3), dtype=np.uint8))
-
-    merger.on_scene(first)
-    assert merger.has_pending() is True  # moves the frame into the timestamp heap
-    merger.on_scene(newest)
-
-    assert merger.pop_ready(force=True) == ("scene", newest)
-    assert merger.scene_queue_drop_count == 1
-    assert merger.has_pending() is False
 
 
 def test_pre_space_abort_creates_no_assignment_or_completed_session(tmp_path: Path) -> None:
@@ -312,6 +267,15 @@ def test_live_action_records_trigger_and_later_presentation_timestamp(
     assert presented["timestamp"] == trigger["payload"]["presentation_timestamp"]
     assert record["payload"]["action_timestamp"] == presented["timestamp"]
 
+    session_report = build_session_summary(tmp_path / "runs", "P-presentation", 1)
+    triggered_report = build_triggered_summary(
+        tmp_path / "runs", "P-presentation", 1
+    )
+    assert session_report["candidate_events"] == 1
+    assert session_report["training_eligible_events"] == 0
+    assert triggered_report["triggered_events"]["total"] == 1
+    assert triggered_report["triggered_events"]["excluded_from_training"] == 1
+
 
 def test_terminated_session_does_not_advance_and_retry_assignment_is_fixed(
     tmp_path: Path,
@@ -340,7 +304,7 @@ def test_cleanup_failure_does_not_publish_completed_session(tmp_path: Path) -> N
 
     config = _config(tmp_path, "P-cleanup-failure", "G")
     with pytest.raises(RuntimeError, match="Guardian stop failed"):
-        run_live_experiment(
+        experiment_runner.run_live_experiment(
             config,
             detector=_Detector(),
             tracker=_Tracker(),
@@ -361,16 +325,91 @@ def test_cleanup_failure_does_not_publish_completed_session(tmp_path: Path) -> N
     assert "health" in calls[calls.index("stop") + 1 :]
 
 
-def test_csv_and_controlled_trials_remain_inactive_in_main_runner(
-    tmp_path: Path,
+def test_staging_failure_does_not_commit_or_advance_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    original_train = experiment_runner.train_next_session_policy
+    failed_once = False
+
+    def fail_first_training(*args, **kwargs):
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise OSError("simulated policy staging failure")
+        return original_train(*args, **kwargs)
+
+    monkeypatch.setattr(
+        experiment_runner, "train_next_session_policy", fail_first_training
+    )
+    config = _config(tmp_path, "P-finalization", "G")
+    with pytest.raises(OSError, match="simulated policy staging failure"):
+        _run(config)
+
+    subject = tmp_path / "runs" / "subjects" / "P-finalization"
+    lineage = subject / "lineage"
+    first_attempt = next((subject / "attempts").iterdir())
+    first_summary = json.loads(
+        (first_attempt / "attempt_summary.json").read_text(encoding="utf-8")
+    )
+    assert first_summary["successful"] is False
+    assert first_summary["session_number"] == 1
+    assert first_summary["stop_reason"] == "session_finalization"
+    assert not (lineage / "completed_session_001.json").exists()
+
+    retry = _run(config)
+    retry_summary = json.loads(
+        (retry / "attempt_summary.json").read_text(encoding="utf-8")
+    )
+    assert retry_summary["successful"] is True
+    assert retry_summary["session_number"] == 1
+    assert (lineage / "completed_session_001.json").is_file()
+    assert not (lineage / "completed_session_002.json").exists()
+
+
+def test_post_commit_report_failure_is_recovered_before_next_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_write = experiment_runner.immutable_write_json
+    failed_once = False
+
+    def fail_first_training_report(path, payload):
+        nonlocal failed_once
+        if not failed_once and Path(path).name == "policy_session_002.training_report.json":
+            failed_once = True
+            raise OSError("simulated training-report publication failure")
+        return original_write(path, payload)
+
+    monkeypatch.setattr(
+        experiment_runner, "immutable_write_json", fail_first_training_report
+    )
+    first = _run(_config(tmp_path, "P-recovery", "G"))
+    first_summary = json.loads(
+        (first / "attempt_summary.json").read_text(encoding="utf-8")
+    )
+    lineage = tmp_path / "runs" / "subjects" / "P-recovery" / "lineage"
+    assert first_summary["successful"] is True
+    assert first_summary["session_number"] == 1
+    assert first_summary["post_commit_warnings"] == [
+        {"operation": "next_training_report", "error": "OSError"}
+    ]
+    assert (lineage / "completed_session_001.json").is_file()
+    assert not (lineage / "policy_session_002.json").exists()
+    assert not (lineage / "policy_session_002.training_report.json").exists()
+
+    second = _run(_config(tmp_path, "P-recovery", "E"))
+    second_summary = json.loads(
+        (second / "attempt_summary.json").read_text(encoding="utf-8")
+    )
+    assert second_summary["successful"] is True
+    assert second_summary["session_number"] == 2
+    assert (lineage / "policy_session_002.json").is_file()
+    assert (lineage / "policy_session_002.training_report.json").is_file()
+    assert (lineage / "completed_session_002.json").is_file()
+
+
+def test_main_runner_rejects_non_cli_model_selection(tmp_path: Path) -> None:
     csv_config = _config(tmp_path, "P-csv")
     csv_config["model_selection"]["source"] = "csv"
     csv_config["model_selection"]["csv"]["enabled"] = True
     with pytest.raises(ValueError, match="requires CLI model selection"):
         _run(csv_config)
-
-    controlled_config = _config(tmp_path, "P-controlled")
-    controlled_config["controlled_intention"]["enabled"] = True
-    with pytest.raises(ValueError, match="placeholders and are not implemented"):
-        _run(controlled_config)

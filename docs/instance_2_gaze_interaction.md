@@ -1,137 +1,71 @@
-# Instance 2 — Vision + gaze interaction
+# Vision and gaze interaction
 
-This subsystem consumes the canonical `foundations.contracts.SceneFrame` and
-`GazeSample` types. It does not define a glasses API, EEG logic, intent model, or
-experimental feedback/labeling logic.
+`gaze_interaction` converts canonical scene and gaze samples into tracked
+objects, one current candidate episode, accumulated dwell, and at most one
+selection trigger per episode. It does not acquire glasses data, process EEG,
+or assign feedback labels.
 
-## Detection and tracking
+## Quick check
 
-`gaze_interaction.detector.YOLOEDetector` wraps Ultralytics YOLOE and the default
-weights are `yoloe-26n-seg-pf.pt`. Constructing the adapter is the point at which
-Ultralytics may resolve/download weights; importing the package never downloads a
-model. Foundation scene frames are RGB, so the adapter explicitly converts them to
-the BGR ndarray convention expected at the Ultralytics prediction boundary.
-
-The default detector confidence threshold is `0.45`. Immediately after YOLOE
-inference, the configured category allowlist maps nuanced raw labels onto stable
-project categories; rejected detections never reach ByteTrack, gaze association,
-dwell, or diagnostics. Matching is case-insensitive and token/phrase-aware, so
-`office chair` matches `chair`, `Apple iPad` maps to `tablet`, and a term such as
-`can` can match `soda can` without matching `candle`. When several terms match, the
-longest (most specific) term wins and category order breaks equal-length ties.
-
-The default categories are `chair`, `laptop`, `cellphone`, `tablet`, and
-`wall poster`. Each category has configurable label terms in
-`detector.category_filter.categories`. Accepted detections use the canonical
-category `name` as their downstream label. Set `category_filter.enabled: false` to
-retain all labels above the confidence threshold. Because lists are replaced
-wholesale by the project configuration merger, an override of `categories` must
-contain the complete desired list.
-
-Detector boxes are clipped to the image, degenerate boxes are discarded, and the
-local `BoundingBox` uses normalized `[0, 1]` coordinates with origin at top-left,
-`+x` right, and `+y` down. `ByteTrackAdapter` uses Supervision's ByteTrack and its
-track IDs are unique/meaningful only inside one pipeline run. A tracker ID change
-is a new interaction identity; there is no cross-track identity recovery.
-
-## Association and candidate episodes
-
-Association uses the newest tracked scene with timestamp `<=` the gaze timestamp
-and rejects it when it is older than `association.max_scene_age_seconds`. It never
-uses a future frame. Invalid gaze, an empty tracked scene, or no containing box
-produces no candidate. Canonical gaze is never clipped or repaired.
-
-When boxes overlap, the containing box with the smallest original area wins;
-higher confidence and then lower track ID are deterministic tie-breakers. The
-configurable normalized box margin defaults to zero.
-
-The frozen downstream episode contract lives at
-`gaze_interaction.episodes.CandidateEpisode`:
-
-```python
-CandidateEpisode(
-    episode_id: int,
-    track_id: int,
-    label: str | None,
-    start_timestamp: float,
-    last_match_timestamp: float,
-    end_timestamp: float | None,
-    end_reason: EpisodeEndReason | None,
-)
-```
-
-All timestamps are non-negative run-relative seconds. The first association starts
-an episode. Repeated association with the same track continues it. Invalid gaze,
-no match, or a temporarily missing track pauses it without extending dwell; the
-same track resumes the episode only within `gap_grace_seconds`. Once the grace
-interval is exceeded, the episode ends at `last_match_timestamp + grace` with
-`gap_timeout`. A different track within the grace interval ends it immediately
-with `candidate_change` and starts another episode. An active episode at source
-end uses `source_end` unless its grace interval had already expired. `label` is the
-track label captured when the episode starts; track identity, not later label text,
-determines continuity.
-
-These are candidate/dwell episodes, not physiological fixation classifications.
-
-## Dwell boundary
-
-`DwellController` accumulates only intervals between consecutive confirmed gaze
-matches for the same episode. Explicit no-match/invalid samples pause dwell and
-`max_sample_gap_seconds` prevents an unobserved long interval from being counted.
-Changing episodes resets dwell. At most one `DwellTrigger` is emitted per episode.
-
-Integration may pass `trigger_gate_open=False` to `DwellController.advance()` or
-`GazeInteractionPipeline.process_gaze()` while an earlier feedback target remains
-open. Dwell continues accumulating, but a threshold crossing becomes
-`DwellState.trigger_pending` and emits no action. If the same episode is still
-active when the gate reopens, the pending trigger is emitted exactly once on the
-next confirmed matching gaze update. Its timestamp is the release update's
-timestamp. No-match updates do not release it, and an episode end or candidate
-change discards it.
-
-`GazeInteractionPipeline.cancel(timestamp, reason)` explicitly ends and clears the
-current candidate, dwell, and pending-trigger state without fabricating a trigger.
-The reason must be `EpisodeEndReason.FEEDBACK_INTERRUPTION` or
-`EpisodeEndReason.SESSION_DURATION_REACHED`. It returns an
-`InteractionCancellation` containing the ended episode, cleared post-cancellation
-dwell state, and whether a pending trigger was discarded. Episode IDs remain
-run-unique after cancellation. Feedback attribution, session timing, and cooldown
-remain Integration responsibilities.
-
-The external `intent_score` is either `None` or a finite value in `[0, 1]`.
-Invalid scores are rejected. `None` uses baseline dwell. Otherwise the requirement
-is:
-
-`clip(baseline_seconds * (1 - maximum_reduction_fraction * intent_score), minimum_seconds, maximum_seconds)`
-
-This is a bounded adaptation of the GazeIntent dwell-scaling principle. The
-controller consumes only the score; it does not estimate intent itself.
-
-## Demo
-
-Install the repository and test dependencies with:
-
-```text
-python -m pip install -e ".[dev]"
-```
-
-Run the complete configured workflow with:
-
-```text
+```bash
 python scripts/run_gaze_interaction.py
-python scripts/run_gaze_interaction.py --config path/to/partial_override.yaml
+python scripts/run_gaze_interaction.py --config path/to/override.yaml
 ```
 
-The default virtual images are deterministic random pixels, useful for
-no-detection/dropout plumbing rather than meaningful detector evaluation. For
-meaningful visual detection diagnostics, use replayed real scene data. Resolved
-configuration is saved as JSON and runtime interaction state is written to JSONL;
-diagnostic PNG frames are saved by default.
+The default uses deterministic virtual frames and is useful for pipeline and
+dropout checks. Use the video/gaze harness or recorded scene input for meaningful
+object-recognition checks.
 
-No external project source code is copied. Runtime reuse is through Ultralytics
-YOLOE (AGPL-3.0/Ultralytics licensing), Supervision's ByteTrack adapter (MIT), and
-OpenCV. The adaptive dwell rule is based on the published GazeIntent approach:
-<https://arxiv.org/abs/2404.13829>.
+## Processing behavior
 
-Supervision is constrained below 0.31 because its 0.30 release deprecates the
-verified `ByteTrack` API and announces its removal in 0.31.
+YOLOE detections above the configured confidence threshold are normalized and
+filtered into project categories before ByteTrack. Association uses only a
+tracked scene at or before the gaze timestamp and rejects stale scenes. When
+boxes overlap, the smallest containing box wins with deterministic tie-breaks.
+
+The same track continues an episode. Invalid/no-match gaze pauses it; a different
+track or an expired grace interval ends it. Dwell accumulates only between
+confirmed matches and ignores unobserved long gaps. A pending threshold crossing
+waits while feedback for an earlier action is open, then releases once if the
+same episode is still current.
+
+The dwell requirement is bounded by the configured baseline, minimum, maximum,
+and optional intent score. The gaze pipeline consumes an intent score but does
+not calculate it.
+
+## Configuration and CLI
+
+The default is `configs/gaze_interaction.yaml`; `configs/practice_gaze.yaml`
+overrides live camera/tracker settings. Key defaults are:
+
+- YOLOE `yoloe-26n-seg-pf.pt`, confidence `0.3`, image size `640`, device
+  `cuda:0`;
+- category filter enabled for chair, laptop, backpack, TV, mug, poster, table,
+  handbag, and box categories;
+- ByteTrack frame rate `10` (`30` in live practice/main);
+- scene age `0.25 s`, episode grace `0.15 s`, and maximum gaze gap `0.10 s`;
+- baseline dwell `1.0 s` with bounded intent reduction.
+
+The CLI exposes only `--config PATH`. Category lists replace the default list
+wholesale in an override.
+
+## Source files
+
+| File | Responsibility |
+| --- | --- |
+| `src/gaze_interaction/__init__.py` | Package boundary. |
+| `src/gaze_interaction/contracts.py` | Detection, tracked-object, scene, and normalized-box records. |
+| `src/gaze_interaction/detector.py` | YOLOE adapter and category mapping. |
+| `src/gaze_interaction/tracker.py` | Supervision ByteTrack adapter. |
+| `src/gaze_interaction/association.py` | Timestamp-safe gaze-to-object association. |
+| `src/gaze_interaction/episodes.py` | Candidate episode lifecycle and end reasons. |
+| `src/gaze_interaction/dwell.py` | Observed dwell accumulation and bounded threshold trigger. |
+| `src/gaze_interaction/pipeline.py` | Scene/gaze orchestration and cancellation boundary. |
+| `src/gaze_interaction/visualization.py` | Diagnostic tracks, gaze, candidate, and dwell overlays. |
+
+Runs write resolved configuration and `events.jsonl`; optional diagnostic frames
+are controlled by `visualization.*`.
+
+```bash
+pytest tests/test_gaze_association.py tests/test_gaze_episodes_dwell.py tests/test_gaze_pipeline.py
+```
