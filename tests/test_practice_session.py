@@ -685,8 +685,11 @@ def test_optional_eeg_uses_shared_clock_and_stops_with_practice(
         return True
 
     monkeypatch.setenv("IDUN_API_TOKEN", "test-token")
+    config = _config(tmp_path, eeg_enabled=True)
+    # Keep every generated EEG timestamp inside the practice cutoff.
+    config["maximum_duration_seconds"] = 0.2
     run = run_practice_session(
-        _config(tmp_path, eeg_enabled=True),
+        config,
         detector=FakeDetector(),
         tracker=FakeTracker(),
         mindlink_factory=mindlink_factory,

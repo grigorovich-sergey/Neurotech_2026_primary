@@ -1,4 +1,4 @@
-"""Run one complete pre-hardware gaze + EEG + paired-learning experiment session."""
+"""Run one hardware-free gaze, EEG, feedback, and learning verification session."""
 
 import argparse
 from pathlib import Path

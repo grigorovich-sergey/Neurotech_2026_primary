@@ -39,11 +39,11 @@ when no-action episodes were ineligible and have no common feedback label.
 
 Usage
 -----
-    python report_triggered_events.py P021 1
-    python report_triggered_events.py P021 1 --runs-root /path/to/runs
-    python report_triggered_events.py P021 1 --json
-    python report_triggered_events.py P021 1 --csv triggered_P021_s001.csv
-    python report_triggered_events.py P021 1 --details
+    python scripts/report_triggered_events.py P021 1
+    python scripts/report_triggered_events.py P021 1 --runs-root /path/to/runs
+    python scripts/report_triggered_events.py P021 1 --json
+    python scripts/report_triggered_events.py P021 1 --csv triggered_P021_s001.csv
+    python scripts/report_triggered_events.py P021 1 --details
 """
 
 from __future__ import annotations

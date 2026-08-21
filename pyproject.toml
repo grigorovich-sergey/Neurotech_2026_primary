@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Research infrastructure for the NeuroTech capstone"
 requires-python = ">=3.10"
 dependencies = [
+    # Upper bound retained for the older GPU machine's PyTorch/CUDA environment.
     "numpy>=1.24,<2.3",
     "PyYAML>=6.0",
     "h5py>=3.8",
